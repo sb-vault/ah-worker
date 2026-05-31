@@ -1,0 +1,10 @@
+name = "sb-flipper"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Optional: add a KV namespace for caching
+# After creating the KV namespace in Cloudflare dashboard, paste the ID below
+# [[kv_namespaces]]
+# binding = "FLIPPER_CACHE"
+# id = "YOUR_KV_NAMESPACE_ID_HERE"
+# preview_id = "YOUR_KV_NAMESPACE_PREVIEW_ID_HERE"
