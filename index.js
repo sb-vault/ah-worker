@@ -183,7 +183,8 @@ async function handleHistory(tag, period, env, ctx) {
 function computeAnalytics(points) {
   if (points.length < 2) return null;
 
-  const prices = points.map(p => p.b || p.s);
+  const prices = points.map(p => p.b || p.s).filter(v => v > 0);
+  if (prices.length < 2) return null;
   const n  = prices.length;
   const mean = prices.reduce((a,b) => a+b, 0) / n;
   const sorted = [...prices].sort((a,b) => a-b);
@@ -192,39 +193,79 @@ function computeAnalytics(points) {
   const max    = sorted[n-1];
   const stdDev = Math.sqrt(prices.reduce((s,p) => s+(p-mean)**2, 0) / n);
 
-  // Current price vs mean
   const current = prices[n-1];
-  const zScore  = stdDev > 0 ? (current - mean) / stdDev : 0;  // -ve = cheap, +ve = expensive
+  const zScore  = stdDev > 0 ? (current - mean) / stdDev : 0;
 
-  // RSI (14-period)
-  const rsi = computeRSI(prices, 14);
+  // RSI with 14-period on hourly points
+  const rsi = computeRSI(prices, Math.min(14, Math.floor(n/3)));
 
-  // Trend: linear regression slope over last 20 points
-  const recent = prices.slice(-20);
+  // Slope over last 48 points (2 days hourly) — price change per data point
+  const recent = prices.slice(-Math.min(48, n));
   const slope  = linearSlope(recent);
 
-  // Volatility (coefficient of variation %)
+  // Hourly interval estimate (time between points in ms)
+  let intervalMs = 3_600_000; // default 1h
+  if (points.length > 1) {
+    const deltas = [];
+    for (let i = 1; i < Math.min(10, points.length); i++) deltas.push(points[i].t - points[i-1].t);
+    intervalMs = deltas.reduce((a,b)=>a+b,0) / deltas.length;
+  }
+  const pointsPerHour = 3_600_000 / Math.max(intervalMs, 60_000);
+  const pointsPerDay  = pointsPerHour * 24;
+
+  // Price change per real hour
+  const slopePerHour = slope * pointsPerHour;
+
   const volatility = mean > 0 ? (stdDev / mean) * 100 : 0;
 
-  // Signal
+  // Signal — requires RSI + z-score agreement
+  // Also consider momentum: price accelerating up/down
+  const recent10 = prices.slice(-10);
+  const momentum = recent10.length > 1 ? (recent10[recent10.length-1] - recent10[0]) / recent10[0] * 100 : 0;
+
   let signal = 'HOLD', signalStrength = 0;
-  if (rsi < 30 && zScore < -0.5) { signal = 'BUY';  signalStrength = Math.min(100, (30 - rsi) * 3 + (-zScore) * 20); }
-  if (rsi > 70 && zScore > 0.5)  { signal = 'SELL'; signalStrength = Math.min(100, (rsi - 70) * 3 + zScore * 20); }
 
-  // Estimated hold time based on recent cycle analysis
-  const holdDays = estimateHoldDays(points, slope);
+  // BUY: oversold (RSI<35) AND cheap vs history (z<-0.3) AND not in freefall (momentum > -5%)
+  if (rsi < 35 && zScore < -0.3 && momentum > -5) {
+    signal = 'BUY';
+    signalStrength = Math.min(100, Math.round((35-rsi)*2.5 + (-zScore)*25 + Math.max(0,momentum)*2));
+  }
+  // SELL: overbought (RSI>65) AND expensive vs history (z>0.3) AND not still rising fast (momentum < 5%)
+  if (rsi > 65 && zScore > 0.3 && momentum < 5) {
+    signal = 'SELL';
+    signalStrength = Math.min(100, Math.round((rsi-65)*2.5 + zScore*25));
+  }
+  // Strong BUY: very oversold
+  if (rsi < 20 && zScore < -1) {
+    signal = 'BUY'; signalStrength = Math.min(100, signalStrength + 20);
+  }
+  // Strong SELL: very overbought
+  if (rsi > 80 && zScore > 1) {
+    signal = 'SELL'; signalStrength = Math.min(100, signalStrength + 20);
+  }
 
-  // Extrapolation (simple linear trend for next 7 days)
-  const extrapolation = extrapolate(points, 7);
+  // Hold time: hours until price returns to mean based on slope
+  const distToMean = mean - current;
+  let holdHours = 24 * 7; // default 1 week
+  if (Math.abs(slopePerHour) > 0.001 && Math.sign(distToMean) === Math.sign(slopePerHour)) {
+    holdHours = Math.max(1, Math.round(Math.abs(distToMean) / Math.abs(slopePerHour)));
+  }
+  const holdDays = Math.max(1, Math.round(holdHours / 24));
+
+  // Expected return %: buying now and selling at mean
+  const expectedReturn = current > 0 ? r2((mean - current) / current * 100) : 0;
+
+  const extrapolation = extrapolate(points, 14, intervalMs); // 14 days ahead
 
   return {
     mean: r1(mean), median: r1(median), min: r1(min), max: r1(max),
     stdDev: r1(stdDev), volatility: r2(volatility),
     current: r1(current), zScore: r2(zScore),
-    rsi: r1(rsi), slope: r4(slope), signal,
+    rsi: r1(rsi), slope: r4(slopePerHour), signal,
     signalStrength: Math.round(signalStrength),
-    holdDays, extrapolation,
-    priceRange: r2(((max-min)/mean)*100), // % range
+    holdDays, expectedReturn, extrapolation,
+    priceRange: r2(((max-min)/mean)*100),
+    momentum: r2(momentum),
   };
 }
 
@@ -256,27 +297,17 @@ function linearSlope(values) {
   return den === 0 ? 0 : num/den;
 }
 
-function estimateHoldDays(points, slope) {
-  if (Math.abs(slope) < 0.001) return 14; // flat — hold 2 weeks
-  const current = points[points.length-1]?.b || 1;
-  const mean    = points.map(p=>p.b||p.s).reduce((a,b)=>a+b,0)/points.length;
-  if (slope > 0 && current < mean) return Math.max(1, Math.round((mean - current) / (slope * 24)));
-  return 7; // default
-}
 
-function extrapolate(points, futureDays) {
+function extrapolate(points, futureDays, intervalMs = 3_600_000) {
   if (points.length < 5) return [];
   const last   = points[points.length-1];
-  const prices = points.map(p => p.b || p.s);
-  const slope  = linearSlope(prices.slice(-30));
-  const intervalMs = futureDays <= 1 ? 300_000 : futureDays <= 7 ? 7_200_000 : 86_400_000;
+  const prices = points.map(p => p.b || p.s).filter(v => v > 0);
+  const slope  = linearSlope(prices.slice(-48)); // slope per data point
   const steps  = Math.round((futureDays * 86_400_000) / intervalMs);
   const result = [];
   for (let i = 1; i <= steps; i++) {
-    result.push({
-      t: last.t + i * intervalMs,
-      b: r1(Math.max(0, last.b + slope * i)),
-    });
+    const projPrice = last.b + slope * i;
+    if (projPrice > 0) result.push({ t: last.t + i * intervalMs, b: r1(projPrice) });
   }
   return result;
 }
