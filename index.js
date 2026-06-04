@@ -38,17 +38,47 @@ export default {
       return json({ success: false, error: 'Cache cold — wait for cron refresh', auctions: [] });
     }
 
-    return new Response('Not found', { status: 404, headers: cors() });
+    // Manual trigger — hit this once to warm the cache
+    if (url.pathname === '/refresh') {
+      ctx.waitUntil(Promise.all([refreshBazaar(env), refreshBIN(env)]));
+      return json({ success: true, message: 'Refresh triggered — check back in 10 seconds' });
+    }
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(refreshBazaar(env));
+    ctx.waitUntil(Promise.all([refreshBazaar(env), refreshBIN(env)]));
   },
 };
 
-async function refreshBazaar(env) {
+async function refreshBIN(env) {
+  const BIN_KEY = 'bin_v8';
   try {
-    // Fetch raw bazaar data
+    const p0 = await hx('https://api.hypixel.net/v2/skyblock/auctions?page=0');
+    if (!p0.success) throw new Error('Hypixel fail');
+    let bins = p0.auctions.filter(a => a.bin).map(slimAuction);
+    const pages = Array.from({ length: p0.totalPages - 1 }, (_, i) => i + 1);
+    for (let i = 0; i < pages.length; i += 30) {
+      const results = await Promise.allSettled(
+        pages.slice(i, i + 30).map(pg => hx(`https://api.hypixel.net/v2/skyblock/auctions?page=${pg}`))
+      );
+      for (const r of results)
+        if (r.status === 'fulfilled' && r.value.success)
+          bins = bins.concat(r.value.auctions.filter(a => a.bin).map(slimAuction));
+    }
+    const data = { success:true, ts:Date.now(), lastUpdated:p0.lastUpdated, totalBIN:bins.length, auctions:bins };
+    await env.FLIPPER_CACHE.put(BIN_KEY, JSON.stringify(data), { expirationTtl: 130 });
+    console.log(`BIN: ${bins.length} auctions cached`);
+  } catch (e) { console.error('BIN refresh:', e.message); }
+}
+
+function slimAuction(a) {
+  const sbTag  = (a.item_name||'').replace(/[✪★☆✦]/g,'').replace(/\[Lvl \d+\]\s*/gi,'').trim()
+    .toUpperCase().replace(/[^A-Z0-9]+/g,'_').replace(/^_+|_+$/g,'');
+  const mcItem = deriveMcItem(a.item_name, a.extra);
+  return { u:a.uuid, e:a.end, n:a.item_name, x:a.extra, c:a.category, t:a.tier, b:a.starting_bid, s:sbTag, m:mcItem };
+}
+
+async function refreshBazaar(env) {
     const r = await fetch('https://api.hypixel.net/v2/skyblock/bazaar', {
       headers: { 'User-Agent': 'sb-flipper/1.0' }
     });
@@ -129,6 +159,36 @@ async function refreshBazaar(env) {
 
 const round1 = v => Math.round(v * 10) / 10;
 const round2 = v => Math.round(v * 100) / 100;
+
+const MC_ITEMS = [
+  "Leather Helmet","Leather Chestplate","Leather Leggings","Leather Boots",
+  "Iron Helmet","Iron Chestplate","Iron Leggings","Iron Boots",
+  "Diamond Helmet","Diamond Chestplate","Diamond Leggings","Diamond Boots",
+  "Chainmail Helmet","Chainmail Chestplate","Chainmail Leggings","Chainmail Boots",
+  "Golden Helmet","Golden Chestplate","Golden Leggings","Golden Boots",
+  "Netherite Helmet","Netherite Chestplate","Netherite Leggings","Netherite Boots",
+  "Iron Sword","Diamond Sword","Golden Sword","Netherite Sword","Wooden Sword","Stone Sword",
+  "Bow","Crossbow","Fishing Rod",
+  "Iron Pickaxe","Diamond Pickaxe","Golden Pickaxe","Netherite Pickaxe",
+  "Iron Axe","Diamond Axe","Golden Axe","Netherite Axe","Iron Shovel","Iron Hoe",
+  "Skull Item","Player Head","Splash Potion","Lingering Potion","Potion",
+  "Enchanted Book","Book","Ink Sack","Paper","Flint","Stick","Feather",
+  "Cooked Fish","Raw Fish","Prismarine Shard","Beacon","End Crystal","Nether Star",
+  "Shears","Clock","Compass","Chest","Hopper","Blaze Rod","Bone","Arrow",
+].sort((a,b) => b.length - a.length);
+
+function deriveMcItem(name, extra) {
+  if (!extra) return null;
+  const cn = (name||'').replace(/[✪★☆✦§\[\]]/g,'').replace(/Lvl \d+/gi,'').trim();
+  const ce = (extra||'').replace(/[✪★☆✦§]/g,'').trim();
+  let rem = ce;
+  if (rem.toLowerCase().startsWith(cn.toLowerCase())) rem = rem.slice(cn.length).trim();
+  for (const mc of MC_ITEMS)
+    if (rem.toLowerCase().startsWith(mc.toLowerCase())) return mc;
+  const words = rem.split(' ').filter(w => w && /^[A-Z]/.test(w));
+  if (words.length >= 2) return words[0]+' '+words[1];
+  return words[0] || null;
+}
 
 function json(d, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json', ...cors() } });
