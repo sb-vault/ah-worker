@@ -148,9 +148,10 @@ async function handleHistory(tag, period, env, ctx) {
     let endpoint;
     if (period === 'hour') endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history/hour`;
     else if (period === 'day') endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history/day`;
-    else { // week — also fetch 30d for trend analysis
+    else { // week/month/month3/month6
       const end   = new Date();
-      const start = new Date(end - 30 * 86400_000);
+      const months = period === 'week' ? 7 : period === 'month3' ? 90 : period === 'month6' ? 180 : 30;
+      const start = new Date(end - months * 86400_000);
       endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
     }
 
