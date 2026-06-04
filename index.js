@@ -1,24 +1,17 @@
-// sb-flipper Bazaar Worker v2
-// 1102 fix: heavy processing only in cron, fetch always serves from KV
-// On cold start (no KV), return minimal loading response — cron will populate
+// sb-flipper Investment Worker v1
+// Bazaar swing trading — NOT market making
+// Uses CoflNet history API + Hypixel election API for event-driven signals
 
-const BZ_KEY  = 'bz_v2';
-const KV_TTL  = 130;
+const BZ_KEY      = 'bz_invest_v1';  // current bazaar snapshot
+const MAYOR_KEY   = 'mayor_v1';      // mayor/election data
+const KV_TTL      = 130;
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors() });
 
-    if (url.pathname === '/lastUpdated') {
-      if (env.FLIPPER_CACHE) {
-        // Check both bazaar and BIN caches
-        const bz = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
-        if (bz) return json({ lastUpdated: bz.lastUpdated, ts: bz.ts });
-      }
-      return json({ lastUpdated: 0 });
-    }
-
+    // ── Current bazaar snapshot (all products) ────────────────────────────────
     if (url.pathname === '/bazaar') {
       if (env.FLIPPER_CACHE) {
         const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
@@ -28,86 +21,62 @@ export default {
       return json({ success: true, loading: true, products: [], lastUpdated: 0, ts: Date.now() });
     }
 
-    // Keep /auctions alive for AH flipper mod
-    if (url.pathname === '/auctions' || url.pathname === '/') {
-      const BIN_KEY = 'bin_v8';
+    // ── Price history for a specific item ─────────────────────────────────────
+    // /history/{tag}?period=week|day|hour
+    if (url.pathname.startsWith('/history/')) {
+      const tag    = decodeURIComponent(url.pathname.slice(9));
+      const period = url.searchParams.get('period') || 'week';
+      return handleHistory(tag, period, env, ctx);
+    }
+
+    // ── Mayor / election data ─────────────────────────────────────────────────
+    if (url.pathname === '/mayor') {
       if (env.FLIPPER_CACHE) {
-        const c = await env.FLIPPER_CACHE.get(BIN_KEY, { type: 'json' });
-        if (c) return json({ ...c, cached: true });
+        const c = await env.FLIPPER_CACHE.get(MAYOR_KEY, { type: 'json' });
+        if (c && Date.now() - (c.ts || 0) < 300_000) return json({ ...c, cached: true });
       }
-      return json({ success: false, error: 'Cache cold — wait for cron refresh', auctions: [] });
+      return handleMayor(env, ctx);
     }
 
-    // Manual trigger — runs synchronously and returns result
+    // ── lastUpdated (cheap poll) ──────────────────────────────────────────────
+    if (url.pathname === '/lastUpdated') {
+      if (env.FLIPPER_CACHE) {
+        const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
+        if (c) return json({ lastUpdated: c.lastUpdated, ts: c.ts });
+      }
+      return json({ lastUpdated: 0 });
+    }
+
+    // ── Manual refresh ────────────────────────────────────────────────────────
     if (url.pathname === '/refresh') {
-      if (!env.FLIPPER_CACHE) {
-        return json({ success: false, error: 'KV binding FLIPPER_CACHE not found. Check Cloudflare dashboard → Workers → Settings → KV Namespace Bindings' });
-      }
+      if (!env.FLIPPER_CACHE)
+        return json({ success: false, error: 'KV binding FLIPPER_CACHE missing' });
       try {
-        await refreshBazaar(env);
+        await Promise.all([refreshBazaar(env), refreshMayor(env)]);
         const bz = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
-        return json({ success: true, bazaarProducts: bz ? bz.count : 0, message: 'Done' });
-      } catch (e) {
-        return json({ success: false, error: e.message });
-      }
-    }
-
-    // Refresh BIN only
-    if (url.pathname === '/refreshBIN') {
-      if (!env.FLIPPER_CACHE) return json({ success: false, error: 'KV not bound' });
-      try {
-        await refreshBIN(env);
-        return json({ success: true, message: 'BIN refreshed' });
-      } catch (e) {
-        return json({ success: false, error: e.message });
-      }
+        return json({ success: true, products: bz ? bz.count : 0, message: 'Refreshed' });
+      } catch (e) { return json({ success: false, error: e.message }); }
     }
 
     if (url.pathname === '/debug') {
       const hasKV = !!env.FLIPPER_CACHE;
-      let bzInfo = 'KV not bound', binInfo = 'KV not bound';
+      let bzInfo = 'not bound', mayInfo = 'not bound';
       if (hasKV) {
-        try { const v = await env.FLIPPER_CACHE.get(BZ_KEY); bzInfo = v ? 'HAS DATA ('+v.length+' chars)' : 'EMPTY'; } catch(e) { bzInfo = 'ERROR:'+e.message; }
-        try { const v = await env.FLIPPER_CACHE.get('bin_v8'); binInfo = v ? 'HAS DATA ('+v.length+' chars)' : 'EMPTY'; } catch(e) { binInfo = 'ERROR:'+e.message; }
+        try { const v = await env.FLIPPER_CACHE.get(BZ_KEY); bzInfo = v ? `${v.length} chars` : 'EMPTY'; } catch(e) { bzInfo = e.message; }
+        try { const v = await env.FLIPPER_CACHE.get(MAYOR_KEY); mayInfo = v ? `${v.length} chars` : 'EMPTY'; } catch(e) { mayInfo = e.message; }
       }
-      return json({ kvBound: hasKV, bazaarCache: bzInfo, binCache: binInfo, hint: hasKV ? 'KV is bound. Visit /refresh to populate.' : 'Go to Cloudflare → Workers → ah-worker → Settings → Variables → add KV binding: FLIPPER_CACHE' });
+      return json({ kvBound: hasKV, bazaarCache: bzInfo, mayorCache: mayInfo });
     }
 
-    return json({ error: 'Not found. Valid routes: /bazaar /auctions /lastUpdated /refresh /refreshBIN /debug' }, 404);
+    return json({ error: 'Not found', routes: ['/bazaar', '/history/{tag}', '/mayor', '/lastUpdated', '/refresh', '/debug'] }, 404);
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(Promise.all([refreshBazaar(env), refreshBIN(env)]));
+    ctx.waitUntil(Promise.all([refreshBazaar(env), refreshMayor(env)]));
   },
 };
 
-async function refreshBIN(env) {
-  const BIN_KEY = 'bin_v8';
-  try {
-    const p0 = await hx('https://api.hypixel.net/v2/skyblock/auctions?page=0');
-    if (!p0.success) throw new Error('Hypixel fail');
-    let bins = p0.auctions.filter(a => a.bin).map(slimAuction);
-    const pages = Array.from({ length: p0.totalPages - 1 }, (_, i) => i + 1);
-    for (let i = 0; i < pages.length; i += 30) {
-      const results = await Promise.allSettled(
-        pages.slice(i, i + 30).map(pg => hx(`https://api.hypixel.net/v2/skyblock/auctions?page=${pg}`))
-      );
-      for (const r of results)
-        if (r.status === 'fulfilled' && r.value.success)
-          bins = bins.concat(r.value.auctions.filter(a => a.bin).map(slimAuction));
-    }
-    const data = { success:true, ts:Date.now(), lastUpdated:p0.lastUpdated, totalBIN:bins.length, auctions:bins };
-    await env.FLIPPER_CACHE.put(BIN_KEY, JSON.stringify(data), { expirationTtl: 130 });
-    console.log(`BIN: ${bins.length} auctions cached`);
-  } catch (e) { console.error('BIN refresh:', e.message); }
-}
-
-function slimAuction(a) {
-  const sbTag  = (a.item_name||'').replace(/[✪★☆✦]/g,'').replace(/\[Lvl \d+\]\s*/gi,'').trim()
-    .toUpperCase().replace(/[^A-Z0-9]+/g,'_').replace(/^_+|_+$/g,'');
-  const mcItem = deriveMcItem(a.item_name, a.extra);
-  return { u:a.uuid, e:a.end, n:a.item_name, x:a.extra, c:a.category, t:a.tier, b:a.starting_bid, s:sbTag, m:mcItem };
-}
+// ── Bazaar snapshot ───────────────────────────────────────────────────────────
 
 async function refreshBazaar(env) {
   try {
@@ -117,110 +86,268 @@ async function refreshBazaar(env) {
     if (!r.ok) throw new Error(`Hypixel ${r.status}`);
     const raw = await r.json();
 
-    // Process in cron context (no CPU limit issue)
     const products = [];
     for (const [id, p] of Object.entries(raw.products || {})) {
       const qs = p.quick_status;
-      if (!qs || qs.buyPrice <= 0 || qs.sellPrice <= 0) continue;
+      if (!qs || qs.buyPrice <= 0) continue;
 
-      const instantBuy   = qs.buyPrice;
-      const instantSell  = qs.sellPrice;
-      const sellWeek     = qs.sellMovingWeek || 0;
-      const buyWeek      = qs.buyMovingWeek  || 0;
+      const buyP    = qs.buyPrice,  sellP   = qs.sellPrice;
+      const buyW    = qs.buyMovingWeek  || 0;
+      const sellW   = qs.sellMovingWeek || 0;
+      const spread  = sellP > 0 && buyP > 0 ? sellP - buyP : 0;
+      const spreadPct = buyP > 0 ? (spread / buyP) * 100 : 0;
 
-      const buySummary  = (p.buy_summary  || []).slice(0, 10);
-      const sellSummary = (p.sell_summary || []).slice(0, 10);
+      // Top order book (slim)
+      const buySummary  = (p.buy_summary  || []).slice(0, 8).map(o => ({ a: Math.round(o.amount), p: r1(o.pricePerUnit), n: o.orders }));
+      const sellSummary = (p.sell_summary || []).slice(0, 8).map(o => ({ a: Math.round(o.amount), p: r1(o.pricePerUnit), n: o.orders }));
+      const topBuy  = buySummary[0]?.p  || 0;
+      const topSell = sellSummary[0]?.p || 0;
+      const buyDepth  = buySummary.reduce( (s, o) => s + o.a, 0);
+      const sellDepth = sellSummary.reduce((s, o) => s + o.a, 0);
 
-      const topBuyPrice  = buySummary.length  > 0 ? buySummary[0].pricePerUnit  : 0;
-      const topSellPrice = sellSummary.length > 0 ? sellSummary[0].pricePerUnit : 0;
-
-      const spread       = topSellPrice > 0 && topBuyPrice > 0 ? topSellPrice - topBuyPrice : 0;
-      const spreadPct    = topBuyPrice  > 0 ? (spread / topBuyPrice) * 100 : 0;
-
-      const flipBuyAt    = topBuyPrice  > 0 ? topBuyPrice  + 0.1 : instantBuy;
-      const flipSellAt   = topSellPrice > 0 ? topSellPrice - 0.1 : instantSell;
-      const flipMargin   = flipSellAt - flipBuyAt;
-      const flipMarginPct= flipBuyAt > 0 ? (flipMargin / flipBuyAt) * 100 : 0;
-
-      const midPrice     = (instantBuy + instantSell) / 2;
-      const weeklyCoins  = Math.min(buyWeek, sellWeek) * midPrice;
-
-      const buyDepth     = buySummary.reduce( (s, o) => s + o.amount, 0);
-      const sellDepth    = sellSummary.reduce((s, o) => s + o.amount, 0);
+      // Momentum = log2(buyWeek/sellWeek)
+      const momentum = Math.log((Math.max(buyW,1)) / (Math.max(sellW,1))) / Math.log(2);
+      // Weekly coin volume (liquidity proxy)
+      const weeklyCoins = Math.min(buyW, sellW) * ((buyP + sellP) / 2);
 
       products.push({
         id,
-        instantBuy:    round1(instantBuy),
-        instantSell:   round1(instantSell),
-        topBuyPrice:   round1(topBuyPrice),
-        topSellPrice:  round1(topSellPrice),
-        spread:        round1(spread),
-        spreadPct:     round2(spreadPct),
-        flipBuyAt:     round1(flipBuyAt),
-        flipSellAt:    round1(flipSellAt),
-        flipMargin:    round1(flipMargin),
-        flipMarginPct: round2(flipMarginPct),
-        sellVol:       qs.sellVolume  || 0,
-        buyVol:        qs.buyVolume   || 0,
-        sellWeek,
-        buyWeek,
-        sellOrders:    qs.sellOrders  || 0,
-        buyOrders:     qs.buyOrders   || 0,
-        weeklyCoins:   Math.round(weeklyCoins),
-        buyDepth,
-        sellDepth,
-        buySummary:    buySummary.map(o => ({ a: Math.round(o.amount), p: round1(o.pricePerUnit), n: o.orders })),
-        sellSummary:   sellSummary.map(o => ({ a: Math.round(o.amount), p: round1(o.pricePerUnit), n: o.orders })),
+        buyP: r1(buyP), sellP: r1(sellP),
+        topBuy: r1(topBuy), topSell: r1(topSell),
+        spread: r1(spread), spreadPct: r2(spreadPct),
+        buyW, sellW,
+        sellVol: qs.sellVolume || 0,
+        buyVol:  qs.buyVolume  || 0,
+        sellOrders: qs.sellOrders || 0,
+        buyOrders:  qs.buyOrders  || 0,
+        weeklyCoins: Math.round(weeklyCoins),
+        buyDepth, sellDepth,
+        momentum: r2(momentum),
+        buySummary, sellSummary,
       });
     }
 
-    const data = {
-      success: true,
-      ts: Date.now(),
-      lastUpdated: raw.lastUpdated,
-      count: products.length,
-      products,
-    };
-
+    const data = { success: true, ts: Date.now(), lastUpdated: raw.lastUpdated, count: products.length, products };
     await env.FLIPPER_CACHE.put(BZ_KEY, JSON.stringify(data), { expirationTtl: KV_TTL });
-    console.log(`Bazaar: ${products.length} products cached`);
+    console.log(`Bazaar: ${products.length} products`);
+  } catch (e) { console.error('Bazaar:', e.message); }
+}
+
+// ── Price history ─────────────────────────────────────────────────────────────
+
+async function handleHistory(tag, period, env, ctx) {
+  const ck = `hist_${tag}_${period}`;
+  const ttl = period === 'hour' ? 120 : period === 'day' ? 300 : 3600;
+
+  if (env.FLIPPER_CACHE) {
+    const c = await env.FLIPPER_CACHE.get(ck, { type: 'json' });
+    if (c && Date.now() - (c.ts||0) < ttl*1000) return json({ ...c, cached: true });
+  }
+
+  try {
+    let endpoint;
+    if (period === 'hour') endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history/hour`;
+    else if (period === 'day') endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history/day`;
+    else { // week — also fetch 30d for trend analysis
+      const end   = new Date();
+      const start = new Date(end - 30 * 86400_000);
+      endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
+    }
+
+    const r = await fetch(endpoint, { headers: { 'User-Agent': 'sb-flipper/1.0', Accept: 'application/json' } });
+    if (!r.ok) throw new Error(`CoflNet ${r.status}`);
+    const raw = await r.json();
+
+    // Slim down and compute analytics
+    const points = raw.map(p => ({
+      t:  new Date(p.timestamp).getTime(),
+      b:  r1(p.buy  || p.buyPrice  || 0),
+      s:  r1(p.sell || p.sellPrice || 0),
+      bv: p.buyVolume  || 0,
+      sv: p.sellVolume || 0,
+    })).filter(p => p.b > 0 || p.s > 0).sort((a,b) => a.t - b.t);
+
+    const analytics = computeAnalytics(points);
+    const data = { success: true, ts: Date.now(), tag, period, points, analytics };
+
+    if (env.FLIPPER_CACHE)
+      ctx.waitUntil(env.FLIPPER_CACHE.put(ck, JSON.stringify(data), { expirationTtl: ttl }));
+
+    return json(data);
   } catch (e) {
-    console.error('Bazaar refresh error:', e.message);
+    return json({ success: false, error: e.message, tag, period, points: [] });
   }
 }
 
-const round1 = v => Math.round(v * 10) / 10;
-const round2 = v => Math.round(v * 100) / 100;
+function computeAnalytics(points) {
+  if (points.length < 2) return null;
 
-const MC_ITEMS = [
-  "Leather Helmet","Leather Chestplate","Leather Leggings","Leather Boots",
-  "Iron Helmet","Iron Chestplate","Iron Leggings","Iron Boots",
-  "Diamond Helmet","Diamond Chestplate","Diamond Leggings","Diamond Boots",
-  "Chainmail Helmet","Chainmail Chestplate","Chainmail Leggings","Chainmail Boots",
-  "Golden Helmet","Golden Chestplate","Golden Leggings","Golden Boots",
-  "Netherite Helmet","Netherite Chestplate","Netherite Leggings","Netherite Boots",
-  "Iron Sword","Diamond Sword","Golden Sword","Netherite Sword","Wooden Sword","Stone Sword",
-  "Bow","Crossbow","Fishing Rod",
-  "Iron Pickaxe","Diamond Pickaxe","Golden Pickaxe","Netherite Pickaxe",
-  "Iron Axe","Diamond Axe","Golden Axe","Netherite Axe","Iron Shovel","Iron Hoe",
-  "Skull Item","Player Head","Splash Potion","Lingering Potion","Potion",
-  "Enchanted Book","Book","Ink Sack","Paper","Flint","Stick","Feather",
-  "Cooked Fish","Raw Fish","Prismarine Shard","Beacon","End Crystal","Nether Star",
-  "Shears","Clock","Compass","Chest","Hopper","Blaze Rod","Bone","Arrow",
-].sort((a,b) => b.length - a.length);
+  const prices = points.map(p => p.b || p.s);
+  const n  = prices.length;
+  const mean = prices.reduce((a,b) => a+b, 0) / n;
+  const sorted = [...prices].sort((a,b) => a-b);
+  const median = sorted[Math.floor(n/2)];
+  const min    = sorted[0];
+  const max    = sorted[n-1];
+  const stdDev = Math.sqrt(prices.reduce((s,p) => s+(p-mean)**2, 0) / n);
 
-function deriveMcItem(name, extra) {
-  if (!extra) return null;
-  const cn = (name||'').replace(/[✪★☆✦§\[\]]/g,'').replace(/Lvl \d+/gi,'').trim();
-  const ce = (extra||'').replace(/[✪★☆✦§]/g,'').trim();
-  let rem = ce;
-  if (rem.toLowerCase().startsWith(cn.toLowerCase())) rem = rem.slice(cn.length).trim();
-  for (const mc of MC_ITEMS)
-    if (rem.toLowerCase().startsWith(mc.toLowerCase())) return mc;
-  const words = rem.split(' ').filter(w => w && /^[A-Z]/.test(w));
-  if (words.length >= 2) return words[0]+' '+words[1];
-  return words[0] || null;
+  // Current price vs mean
+  const current = prices[n-1];
+  const zScore  = stdDev > 0 ? (current - mean) / stdDev : 0;  // -ve = cheap, +ve = expensive
+
+  // RSI (14-period)
+  const rsi = computeRSI(prices, 14);
+
+  // Trend: linear regression slope over last 20 points
+  const recent = prices.slice(-20);
+  const slope  = linearSlope(recent);
+
+  // Volatility (coefficient of variation %)
+  const volatility = mean > 0 ? (stdDev / mean) * 100 : 0;
+
+  // Signal
+  let signal = 'HOLD', signalStrength = 0;
+  if (rsi < 30 && zScore < -0.5) { signal = 'BUY';  signalStrength = Math.min(100, (30 - rsi) * 3 + (-zScore) * 20); }
+  if (rsi > 70 && zScore > 0.5)  { signal = 'SELL'; signalStrength = Math.min(100, (rsi - 70) * 3 + zScore * 20); }
+
+  // Estimated hold time based on recent cycle analysis
+  const holdDays = estimateHoldDays(points, slope);
+
+  // Extrapolation (simple linear trend for next 7 days)
+  const extrapolation = extrapolate(points, 7);
+
+  return {
+    mean: r1(mean), median: r1(median), min: r1(min), max: r1(max),
+    stdDev: r1(stdDev), volatility: r2(volatility),
+    current: r1(current), zScore: r2(zScore),
+    rsi: r1(rsi), slope: r4(slope), signal,
+    signalStrength: Math.round(signalStrength),
+    holdDays, extrapolation,
+    priceRange: r2(((max-min)/mean)*100), // % range
+  };
 }
+
+function computeRSI(prices, period = 14) {
+  if (prices.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = prices[i] - prices[i-1];
+    if (diff > 0) gains  += diff;
+    else          losses -= diff;
+  }
+  let avgGain = gains / period, avgLoss = losses / period;
+  for (let i = period + 1; i < prices.length; i++) {
+    const diff = prices[i] - prices[i-1];
+    avgGain = (avgGain * (period-1) + Math.max(0, diff))  / period;
+    avgLoss = (avgLoss * (period-1) + Math.max(0,-diff)) / period;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+
+function linearSlope(values) {
+  const n = values.length;
+  if (n < 2) return 0;
+  const xm = (n-1)/2;
+  const ym = values.reduce((a,b)=>a+b,0)/n;
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) { num += (i-xm)*(values[i]-ym); den += (i-xm)**2; }
+  return den === 0 ? 0 : num/den;
+}
+
+function estimateHoldDays(points, slope) {
+  if (Math.abs(slope) < 0.001) return 14; // flat — hold 2 weeks
+  const current = points[points.length-1]?.b || 1;
+  const mean    = points.map(p=>p.b||p.s).reduce((a,b)=>a+b,0)/points.length;
+  if (slope > 0 && current < mean) return Math.max(1, Math.round((mean - current) / (slope * 24)));
+  return 7; // default
+}
+
+function extrapolate(points, futureDays) {
+  if (points.length < 5) return [];
+  const last   = points[points.length-1];
+  const prices = points.map(p => p.b || p.s);
+  const slope  = linearSlope(prices.slice(-30));
+  const intervalMs = futureDays <= 1 ? 300_000 : futureDays <= 7 ? 7_200_000 : 86_400_000;
+  const steps  = Math.round((futureDays * 86_400_000) / intervalMs);
+  const result = [];
+  for (let i = 1; i <= steps; i++) {
+    result.push({
+      t: last.t + i * intervalMs,
+      b: r1(Math.max(0, last.b + slope * i)),
+    });
+  }
+  return result;
+}
+
+// ── Mayor / election ──────────────────────────────────────────────────────────
+
+async function handleMayor(env, ctx) {
+  try {
+    const data = await refreshMayor(env);
+    return json(data);
+  } catch (e) { return json({ success: false, error: e.message }); }
+}
+
+async function refreshMayor(env) {
+  const r = await fetch('https://api.hypixel.net/resources/skyblock/election', {
+    headers: { 'User-Agent': 'sb-flipper/1.0' }
+  });
+  if (!r.ok) throw new Error(`Hypixel election ${r.status}`);
+  const raw = await r.json();
+
+  const data = {
+    success: true, ts: Date.now(),
+    currentMayor:   raw.mayor?.name || null,
+    currentPerks:   raw.mayor?.perks?.map(p => p.name) || [],
+    nextElectionTs: computeNextElection(),
+    candidates:     (raw.current?.candidates || []).map(c => ({
+      name: c.name,
+      perks: c.perks?.map(p => p.name) || [],
+      votes: c.votes || 0,
+    })),
+    // Items affected by common mayors
+    mayorImpact: getMayorImpact(raw.mayor?.name),
+  };
+
+  if (env.FLIPPER_CACHE)
+    await env.FLIPPER_CACHE.put(MAYOR_KEY, JSON.stringify(data), { expirationTtl: 300 });
+  return data;
+}
+
+// Known mayor market impacts — which items spike/drop
+function getMayorImpact(mayor) {
+  const impacts = {
+    'Diana': ['GRIFFIN_FEATHER','MINOS_RELIC','CHIMERA','FLAWED_DIAMOND_GEM'],
+    'Scorpius': ['CORRUPTED_FRAGMENT','BRIBE'],
+    'Jerry':  ['JERRY_BOX','BLUE_JERRY','GREEN_JERRY','PURPLE_JERRY','GOLDEN_JERRY'],
+    'Cole':   ['HOT_STUFF','COAL','LAVA_BUCKET'],
+    'Paul':   ['OVERLOAD_1','REJUVENATE_1'],
+    'Finnegan': ['WHEAT','POTATO_ITEM','CARROT_ITEM','MUSHROOM_COLLECTION','CACTUS'],
+    'Derpy':  ['ENCHANTED_EGG','SUPER_EGG','RABBIT_HAT'],
+    'Aatrox': ['MADDOX_BATPHONE','KUUDRA_TEETH'],
+    'Foxy':   ['FESTIVAL_MASK_BEAR','FESTIVAL_MASK_FOX','FESTIVAL_MASK_WOLF'],
+  };
+  return impacts[mayor] || [];
+}
+
+// SkyBlock year ≈ 124 real hours = 5.166 days
+// Election changes every SkyBlock year
+function computeNextElection() {
+  const SB_YEAR_MS = 124 * 60 * 60 * 1000;
+  // SkyBlock epoch: Jan 2 2019 00:00 UTC approximately
+  const epoch = new Date('2019-01-02T00:00:00Z').getTime();
+  const now   = Date.now();
+  const elapsed = now - epoch;
+  const yearsSince = Math.floor(elapsed / SB_YEAR_MS);
+  return epoch + (yearsSince + 1) * SB_YEAR_MS;
+}
+
+// ── Util ──────────────────────────────────────────────────────────────────────
+
+const r1 = v => Math.round(v * 10) / 10;
+const r2 = v => Math.round(v * 100) / 100;
+const r4 = v => Math.round(v * 10000) / 10000;
 
 function json(d, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json', ...cors() } });
