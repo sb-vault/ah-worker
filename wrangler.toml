@@ -1,10 +1,7 @@
 name = "ah-worker"
-main = "index.js"
+main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Optional: add a KV namespace for caching
-# After creating the KV namespace in Cloudflare dashboard, paste the ID below
-# [[kv_namespaces]]
-# binding = "FLIPPER_CACHE"
-# id = "d5364d46ae9f410b93dc7ff20dd384fd"
-# preview_id = "YOUR_KV_NAMESPACE_PREVIEW_ID_HERE"
+[[kv_namespaces]]
+binding = "FLIPPER_CACHE"
+id = "5e22e5866cd44685986af800ab4ddcd4"
