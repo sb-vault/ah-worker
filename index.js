@@ -38,11 +38,42 @@ export default {
       return json({ success: false, error: 'Cache cold — wait for cron refresh', auctions: [] });
     }
 
-    // Manual trigger — hit this once to warm the cache
+    // Manual trigger — runs synchronously and returns result
     if (url.pathname === '/refresh') {
-      ctx.waitUntil(Promise.all([refreshBazaar(env), refreshBIN(env)]));
-      return json({ success: true, message: 'Refresh triggered — check back in 10 seconds' });
+      if (!env.FLIPPER_CACHE) {
+        return json({ success: false, error: 'KV binding FLIPPER_CACHE not found. Check Cloudflare dashboard → Workers → Settings → KV Namespace Bindings' });
+      }
+      try {
+        await refreshBazaar(env);
+        const bz = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
+        return json({ success: true, bazaarProducts: bz ? bz.count : 0, message: 'Done' });
+      } catch (e) {
+        return json({ success: false, error: e.message });
+      }
     }
+
+    // Refresh BIN only
+    if (url.pathname === '/refreshBIN') {
+      if (!env.FLIPPER_CACHE) return json({ success: false, error: 'KV not bound' });
+      try {
+        await refreshBIN(env);
+        return json({ success: true, message: 'BIN refreshed' });
+      } catch (e) {
+        return json({ success: false, error: e.message });
+      }
+    }
+
+    if (url.pathname === '/debug') {
+      const hasKV = !!env.FLIPPER_CACHE;
+      let bzInfo = 'KV not bound', binInfo = 'KV not bound';
+      if (hasKV) {
+        try { const v = await env.FLIPPER_CACHE.get(BZ_KEY); bzInfo = v ? 'HAS DATA ('+v.length+' chars)' : 'EMPTY'; } catch(e) { bzInfo = 'ERROR:'+e.message; }
+        try { const v = await env.FLIPPER_CACHE.get('bin_v8'); binInfo = v ? 'HAS DATA ('+v.length+' chars)' : 'EMPTY'; } catch(e) { binInfo = 'ERROR:'+e.message; }
+      }
+      return json({ kvBound: hasKV, bazaarCache: bzInfo, binCache: binInfo, hint: hasKV ? 'KV is bound. Visit /refresh to populate.' : 'Go to Cloudflare → Workers → ah-worker → Settings → Variables → add KV binding: FLIPPER_CACHE' });
+    }
+
+    return json({ error: 'Not found. Valid routes: /bazaar /auctions /lastUpdated /refresh /refreshBIN /debug' }, 404);
   },
 
   async scheduled(event, env, ctx) {
@@ -79,6 +110,7 @@ function slimAuction(a) {
 }
 
 async function refreshBazaar(env) {
+  try {
     const r = await fetch('https://api.hypixel.net/v2/skyblock/bazaar', {
       headers: { 'User-Agent': 'sb-flipper/1.0' }
     });
