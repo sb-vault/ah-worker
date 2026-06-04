@@ -12,8 +12,9 @@ export default {
 
     if (url.pathname === '/lastUpdated') {
       if (env.FLIPPER_CACHE) {
-        const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
-        if (c) return json({ lastUpdated: c.lastUpdated, ts: c.ts });
+        // Check both bazaar and BIN caches
+        const bz = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
+        if (bz) return json({ lastUpdated: bz.lastUpdated, ts: bz.ts });
       }
       return json({ lastUpdated: 0 });
     }
@@ -23,10 +24,18 @@ export default {
         const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
         if (c) return json({ ...c, cached: true });
       }
-      // Cold start — trigger cron manually and return loading state
-      // Don't process inline (1102 risk). Just trigger bg refresh.
       ctx.waitUntil(refreshBazaar(env));
       return json({ success: true, loading: true, products: [], lastUpdated: 0, ts: Date.now() });
+    }
+
+    // Keep /auctions alive for AH flipper mod
+    if (url.pathname === '/auctions' || url.pathname === '/') {
+      const BIN_KEY = 'bin_v8';
+      if (env.FLIPPER_CACHE) {
+        const c = await env.FLIPPER_CACHE.get(BIN_KEY, { type: 'json' });
+        if (c) return json({ ...c, cached: true });
+      }
+      return json({ success: false, error: 'Cache cold — wait for cron refresh', auctions: [] });
     }
 
     return new Response('Not found', { status: 404, headers: cors() });
