@@ -338,14 +338,20 @@ async function refreshMayor(env) {
     success: true, ts: Date.now(),
     currentMayor:   raw.mayor?.name || null,
     currentPerks:   raw.mayor?.perks?.map(p => p.name) || [],
-    nextElectionTs: computeNextElection(),
+    // Use the API's own election closing time — it knows exactly when it ends
+    // raw.current.closing is the election end timestamp in ms
+    // If not present, fall back to computed value
+    nextElectionTs: raw.current?.closing
+      || raw.mayor?.electionEntry?.closing
+      || computeNextElection(),
     candidates:     (raw.current?.candidates || []).map(c => ({
       name: c.name,
       perks: c.perks?.map(p => p.name) || [],
       votes: c.votes || 0,
     })),
-    // Items affected by common mayors
     mayorImpact: getMayorImpact(raw.mayor?.name),
+    // Include raw for debugging
+    rawCurrentKeys: raw.current ? Object.keys(raw.current) : [],
   };
 
   if (env.FLIPPER_CACHE)
