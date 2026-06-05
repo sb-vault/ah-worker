@@ -33,7 +33,7 @@ export default {
     if (url.pathname === '/mayor') {
       if (env.FLIPPER_CACHE) {
         const c = await env.FLIPPER_CACHE.get(MAYOR_KEY, { type: 'json' });
-        if (c && Date.now() - (c.ts || 0) < 300_000) return json({ ...c, cached: true });
+        if (c && Date.now() - (c.ts || 0) < 300000) return json({ ...c, cached: true });
       }
       return handleMayor(env, ctx);
     }
@@ -152,12 +152,12 @@ async function handleHistory(tag, period, env, ctx) {
       endpoint = `${base}/history/hour`;
     } else if (period === 'day') {
       // Last 48 hours at hourly resolution
-      const end = new Date(), start = new Date(end - 2 * 86400_000);
+      const end = new Date(), start = new Date(end - 2 * 86400000);
       endpoint = `${base}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
     } else {
       // week=7d, month=30d, month3=90d, month6=180d — all at hourly resolution
       const days = period === 'week' ? 7 : period === 'month3' ? 90 : period === 'month6' ? 180 : 30;
-      const end  = new Date(), start = new Date(end - days * 86400_000);
+      const end  = new Date(), start = new Date(end - days * 86400000);
       endpoint = `${base}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
     }
 
@@ -210,13 +210,13 @@ function computeAnalytics(points) {
   const slope  = linearSlope(recent);
 
   // Hourly interval estimate (time between points in ms)
-  let intervalMs = 3_600_000; // default 1h
+  let intervalMs = 3600000; // default 1h
   if (points.length > 1) {
     const deltas = [];
     for (let i = 1; i < Math.min(10, points.length); i++) deltas.push(points[i].t - points[i-1].t);
     intervalMs = deltas.reduce((a,b)=>a+b,0) / deltas.length;
   }
-  const pointsPerHour = 3_600_000 / Math.max(intervalMs, 60_000);
+  const pointsPerHour = 3600000 / Math.max(intervalMs, 60000);
   const pointsPerDay  = pointsPerHour * 24;
 
   // Price change per real hour
@@ -304,12 +304,12 @@ function linearSlope(values) {
 }
 
 
-function extrapolate(points, futureDays, intervalMs = 3_600_000) {
+function extrapolate(points, futureDays, intervalMs = 3600000) {
   if (points.length < 5) return [];
   const last   = points[points.length-1];
   const prices = points.map(p => p.b || p.s).filter(v => v > 0);
   const slope  = linearSlope(prices.slice(-48)); // slope per data point
-  const steps  = Math.round((futureDays * 86_400_000) / intervalMs);
+  const steps  = Math.round((futureDays * 86400000) / intervalMs);
   const result = [];
   for (let i = 1; i <= steps; i++) {
     const projPrice = last.b + slope * i;
