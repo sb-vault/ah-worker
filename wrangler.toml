@@ -1,7 +1,13 @@
 name = "ah-worker"
-main = "index.js"
-compatibility_date = "2024-01-01"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+[build]
+command = ""
 
 [[kv_namespaces]]
 binding = "FLIPPER_CACHE"
 id = "5e22e5866cd44685986af800ab4ddcd4"
+
+[triggers]
+crons = ["* * * * *"]
