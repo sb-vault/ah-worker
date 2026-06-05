@@ -146,13 +146,19 @@ async function handleHistory(tag, period, env, ctx) {
 
   try {
     let endpoint;
-    if (period === 'hour') endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history/hour`;
-    else if (period === 'day') endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history/day`;
-    else { // week/month/month3/month6
-      const end   = new Date();
-      const months = period === 'week' ? 7 : period === 'month3' ? 90 : period === 'month6' ? 180 : 30;
-      const start = new Date(end - months * 86400_000);
-      endpoint = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
+    const base = `https://sky.coflnet.com/api/bazaar/${encodeURIComponent(tag)}`;
+    if (period === 'hour') {
+      // Last 24 hours at ~5min resolution
+      endpoint = `${base}/history/hour`;
+    } else if (period === 'day') {
+      // Last 48 hours at hourly resolution
+      const end = new Date(), start = new Date(end - 2 * 86400_000);
+      endpoint = `${base}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
+    } else {
+      // week=7d, month=30d, month3=90d, month6=180d — all at hourly resolution
+      const days = period === 'week' ? 7 : period === 'month3' ? 90 : period === 'month6' ? 180 : 30;
+      const end  = new Date(), start = new Date(end - days * 86400_000);
+      endpoint = `${base}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
     }
 
     const r = await fetch(endpoint, { headers: { 'User-Agent': 'sb-flipper/1.0', Accept: 'application/json' } });
@@ -363,16 +369,17 @@ function getMayorImpact(mayor) {
   return impacts[mayor] || [];
 }
 
-// SkyBlock year ≈ 124 real hours = 5.166 days
-// Election changes every SkyBlock year
+// SkyBlock year = 124 real hours = 446,400,000 ms
+// SkyBlock started approximately June 11 2019
+// Election happens at the end of each SkyBlock year (Late Winter → Early Spring)
 function computeNextElection() {
-  const SB_YEAR_MS = 124 * 60 * 60 * 1000;
-  // SkyBlock epoch: Jan 2 2019 00:00 UTC approximately
-  const epoch = new Date('2019-01-02T00:00:00Z').getTime();
-  const now   = Date.now();
-  const elapsed = now - epoch;
-  const yearsSince = Math.floor(elapsed / SB_YEAR_MS);
-  return epoch + (yearsSince + 1) * SB_YEAR_MS;
+  const SB_EPOCH   = 1560272700000; // June 11 2019 ~17:05 UTC (approximate)
+  const SB_YEAR_MS = 124 * 60 * 60 * 1000; // 124 real hours
+  const now = Date.now();
+  const elapsed = now - SB_EPOCH;
+  const currentYear = Math.floor(elapsed / SB_YEAR_MS);
+  // Next election = start of next SB year
+  return SB_EPOCH + (currentYear + 1) * SB_YEAR_MS;
 }
 
 // ── Util ──────────────────────────────────────────────────────────────────────
