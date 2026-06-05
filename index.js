@@ -152,12 +152,12 @@ async function handleHistory(tag, period, env, ctx) {
       endpoint = `${base}/history/hour`;
     } else if (period === 'day') {
       // Last 48 hours at hourly resolution
-      const end = new Date(), start = new Date(end - 2 * 86400000);
+      const end = new Date(), start = new Date(end.getTime() - 2 * 86400000);
       endpoint = `${base}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
     } else {
       // week=7d, month=30d, month3=90d, month6=180d — all at hourly resolution
       const days = period === 'week' ? 7 : period === 'month3' ? 90 : period === 'month6' ? 180 : 30;
-      const end  = new Date(), start = new Date(end - days * 86400000);
+      const end  = new Date(), start = new Date(end.getTime() - days * 86400000);
       endpoint = `${base}/history?start=${start.toISOString()}&end=${end.toISOString()}`;
     }
 
