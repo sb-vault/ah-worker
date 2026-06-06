@@ -171,16 +171,17 @@ async function refreshMayor(env) {
   }
 
   // Voting closes = raw.current?.closing, mayor takes effect 1 SB year later
-  // raw.current.closing = when voting closes
-  // New mayor takes effect ~24h after voting closes (1d7h gap but empirically 24h)
+  // raw.current.closing is EXACTLY what Hypixel shows in-game as election end
+  // Do NOT add or subtract anything — use it directly
   const rawClosing = raw.current?.closing || 0;
-  const MAYOR_EFFECT_DELAY = 24 * 3600000; // 24h after voting closes
+  // Fallback: compute from SB epoch if API doesn't give it
   const sbYearsElapsed = Math.floor((Date.now() - SB_EPOCH) / SB_YEAR_MS);
-  const computedClose = SB_EPOCH + (sbYearsElapsed + 1) * SB_YEAR_MS;
-  // votingCloses = when you can no longer vote
-  const votingCloses = rawClosing > Date.now() ? rawClosing : (computedClose - MAYOR_EFFECT_DELAY);
-  // mayorEffectTs = when new mayor actually takes effect (shown in-game)
-  const mayorEffectTs = votingCloses + MAYOR_EFFECT_DELAY;
+  // Election ends at Late Spring 27 = 93/124 through the SkyBlock year
+  // That's 0.75 through the year (93 hours into 124 hour year)
+  const sbYearStart = SB_EPOCH + sbYearsElapsed * SB_YEAR_MS;
+  const computedClose = sbYearStart + Math.round(0.75 * SB_YEAR_MS); // Late Spring 27
+  const votingCloses = rawClosing > Date.now() ? rawClosing : computedClose;
+  const mayorEffectTs = votingCloses; // election end = mayor takes effect immediately
 
   const data = {
     success: true, ts: Date.now(),
