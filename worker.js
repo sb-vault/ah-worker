@@ -350,187 +350,215 @@ function computeAnalytics(points, tag, mayorData, jacobContests) {
 }
 
 // ── Prediction engine ─────────────────────────────────────────────────────────
-// Builds realistic forward prediction using:
-// 1. Extracted SkyBlock seasonal pattern (16 bins across SB year)
-// 2. Fourier-like cycle detection (find dominant period in price data)
-// 3. Event-aware price adjustments (mayor perks + fixed events + Jacob contests)
-// 4. Volatility-scaled noise
-// 5. Momentum decay
+// Multi-model blend:
+// 1. Dominant-cycle sine projection (from autocorrelation)
+// 2. Seasonal pattern from SkyBlock year bins (for event-driven items)
+// 3. Long-term linear trend
+// 4. Event impulse responses (sharp spike then revert)
+// 5. Correlated random walk (volatility-scaled, not white noise)
 
 function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, intervalMs, mayorData, jacobContests) {
-  const last=points[points.length-1];
-  if(!last||prices.length<10) return [];
-  // Step at exactly 1 SkyBlock day (20 real minutes) so events fire at correct SB calendar positions
-  // Output every 3rd step (= 1 real hour) to keep payload manageable
-  const stepMs  = SB_DAY_MS;          // 1200000ms = 20 min = 1 SkyBlock day
-  const outputEvery = 3;              // store every 3rd step = 1 real hour resolution
-  const futureDays  = 30;
-  const steps = Math.round(futureDays * 86400000 / stepMs); // 2160 SkyBlock days
+  const last = points[points.length - 1];
+  if (!last || prices.length < 10) return [];
 
-  // ── 1. Seasonal pattern: bin prices by SB year phase (32 bins) ─────────────
-  const NUM_BINS=32;
-  const binData=Array.from({length:NUM_BINS},()=>({vals:[]}));
-  for(const pt of points){
-    const price=pt.b||pt.s; if(price<=0) continue;
-    const phase=((pt.t-SB_EPOCH)%SB_YEAR_MS+SB_YEAR_MS)%SB_YEAR_MS/SB_YEAR_MS;
-    const bin=Math.min(NUM_BINS-1,Math.floor(phase*NUM_BINS));
-    binData[bin].vals.push(price/mean);
+  const stepMs     = SB_DAY_MS;  // 20min = 1 SkyBlock day for event precision
+  const outputEvery = 3;          // output every 3rd step = 1 real hour
+  const futureDays = 30;
+  const steps      = Math.round(futureDays * 86400000 / stepMs);
+
+  // ── Model 1: Dominant cycle from autocorrelation ──────────────────────────
+  // Scan lags from 1h to 1 SkyBlock year to find the dominant price cycle
+  const maxLagSteps = Math.round(SB_YEAR_MS / stepMs);  // ~372 steps = 1 SB year
+  let bestCycleSteps = 0, bestCorr = -Infinity;
+  const n = prices.length;
+  // Subsample prices to step resolution for autocorrelation
+  const subsample = Math.max(1, Math.round(intervalMs / stepMs));
+  const subPrices = prices.filter((_, i) => i % subsample === 0);
+  const subN = subPrices.length;
+  const subMean = subPrices.reduce((a,b)=>a+b,0)/subN;
+  const centred = subPrices.map(p => p - subMean);
+
+  for (let lag = 3; lag <= Math.min(maxLagSteps, subN-1); lag += Math.max(1, Math.floor(lag/10))) {
+    let corr = 0, denom = 0;
+    for (let i = lag; i < subN; i++) {
+      corr  += centred[i] * centred[i-lag];
+      denom += centred[i] * centred[i];
+    }
+    if (denom > 0) { const r = corr/denom; if (r > bestCorr) { bestCorr=r; bestCycleSteps=lag; } }
   }
-  // Compute median per bin (robust to outliers)
-  const pattern=binData.map((b,i)=>{
-    if(b.vals.length===0) return null;
-    const s=[...b.vals].sort((a,c)=>a-c);
-    return s[Math.floor(s.length/2)];
+
+  // Cycle amplitude: std dev of the cyclic component
+  const cycleAmp = bestCorr > 0.1 && bestCycleSteps > 0
+    ? stdDev * Math.sqrt(bestCorr) * 0.6
+    : 0;
+
+  // Current phase of detected cycle
+  const cyclePhaseOffset = bestCycleSteps > 0
+    ? (subN % bestCycleSteps) / bestCycleSteps * 2 * Math.PI
+    : 0;
+
+  // ── Model 2: SkyBlock seasonal pattern (16 bins) ──────────────────────────
+  const NUM_BINS = 16;
+  const bins = Array.from({length: NUM_BINS}, () => ({vals:[]}));
+  for (const pt of points) {
+    const price = pt.b || pt.s; if (price <= 0) continue;
+    const phase = ((pt.t - SB_EPOCH) % SB_YEAR_MS + SB_YEAR_MS) % SB_YEAR_MS / SB_YEAR_MS;
+    const bin   = Math.min(NUM_BINS-1, Math.floor(phase * NUM_BINS));
+    bins[bin].vals.push(price / mean);
+  }
+  const pattern = bins.map((b, i) => {
+    if (b.vals.length < 2) return null;
+    const s = [...b.vals].sort((a,c)=>a-c);
+    return s[Math.floor(s.length/2)]; // median
   });
-  // Fill null bins with interpolation
-  for(let i=0;i<NUM_BINS;i++){
-    if(pattern[i]===null){
-      for(let d=1;d<NUM_BINS;d++){
-        const prev=pattern[(i-d+NUM_BINS)%NUM_BINS];
-        const next=pattern[(i+d)%NUM_BINS];
-        if(prev!==null&&next!==null){ pattern[i]=(prev+next)/2; break; }
-        if(prev!==null){ pattern[i]=prev; break; }
-        if(next!==null){ pattern[i]=next; break; }
+  // Fill gaps via interpolation
+  for (let i = 0; i < NUM_BINS; i++) {
+    if (pattern[i] === null) {
+      for (let d = 1; d < NUM_BINS; d++) {
+        const p2 = pattern[(i-d+NUM_BINS)%NUM_BINS], n2 = pattern[(i+d)%NUM_BINS];
+        if (p2!==null && n2!==null) { pattern[i]=(p2+n2)/2; break; }
+        if (p2!==null) { pattern[i]=p2; break; }
+        if (n2!==null) { pattern[i]=n2; break; }
       }
-      if(pattern[i]===null) pattern[i]=1.0;
+      if (pattern[i]===null) pattern[i]=1.0;
     }
   }
+  // Measure pattern strength: std dev of pattern values
+  const patMean = pattern.reduce((a,b)=>a+b,0)/NUM_BINS;
+  const patStd  = Math.sqrt(pattern.reduce((s,v)=>s+(v-patMean)**2,0)/NUM_BINS);
+  // If pattern is flat (patStd < 0.01), don't use it — item has no seasonal cycle
+  const usePattern = patStd > 0.01;
 
-  // ── 2. Autocorrelation cycle detection ─────────────────────────────────────
-  // Find dominant cycle length in the price data
-  const maxLag=Math.min(prices.length-1,Math.round(SB_YEAR_MS/stepMs)); // up to 1 SB year
-  let bestCycleLen=0, bestCorr=0;
-  const centred=prices.map(p=>p-mean);
-  for(let lag=Math.max(5,Math.round(maxLag/20));lag<=maxLag;lag+=Math.max(1,Math.round(maxLag/200))){
-    let corr=0;
-    for(let i=lag;i<centred.length;i++) corr+=centred[i]*centred[i-lag];
-    corr/=(centred.length-lag);
-    if(corr>bestCorr){ bestCorr=corr; bestCycleLen=lag; }
-  }
-  // Cycle amplitude: how much the detected cycle contributes
-  const cycleAmp = bestCycleLen>0 ? Math.min(stdDev*0.5, Math.sqrt(bestCorr/prices.length)) : 0;
+  // ── Model 3: Long-term trend ───────────────────────────────────────────────
+  const trendN = Math.min(prices.length, Math.round(90 * 86400000 / intervalMs));
+  const longSlope = linearSlope(prices.slice(-trendN)); // per data-interval step
+  // Convert to per-stepMs
+  const slopePerStep = longSlope * (intervalMs / stepMs);
 
-  // ── 3. Event boost at a given timestamp ────────────────────────────────────
-  const getEventBoost = (ts, nowTs) => {
-    let boost=1.0;
-    const reasons=[];
-    const sbDay=sbDayOfYear(ts);
+  // ── Event boost function ───────────────────────────────────────────────────
+  const getEventInfo = (ts) => {
+    let boost = 0;
+    const reasons = [];
+    const sbDay = sbDayOfYear(ts);
 
     // Fixed annual events
-    for(const evt of FIXED_EVENTS){
-      if(sbDay>=evt.start&&sbDay<=evt.end){
-        const itemMatch = evt.items.some(id=>{
-          const t=tag.toUpperCase();
-          return t===id||t.includes(id.replace('_ITEM','').split('_')[0])||id.split('_')[0]===t.split('_')[0];
+    for (const evt of FIXED_EVENTS) {
+      if (sbDay >= evt.start && sbDay <= evt.end) {
+        const match = evt.items.some(id => {
+          const t = tag.toUpperCase(), idU = id.toUpperCase();
+          return t===idU || t.includes(idU.split('_')[0]) || idU.split('_')[0]===t.split('_')[0];
         });
-        if(itemMatch){
-          const mult = evt.spikeAt&&sbDay>=evt.spikeAt ? (evt.spikeMult||evt.mult) : evt.mult;
-          boost*=mult;
-          reasons.push({event:evt.name,mult});
+        if (match) {
+          const m = evt.spikeAt && sbDay >= evt.spikeAt ? (evt.spikeMult||evt.mult) : evt.mult;
+          boost += m - 1.0;
+          reasons.push(evt.name);
         }
       }
     }
 
-    // Mayor perks — fade after election
-    if(mayorData?.itemEffects?.[tag]){
-      const effect=mayorData.itemEffects[tag];
-      if(mayorData.electionClosing>0&&ts>mayorData.electionClosing){
-        // Mayor changed — revert over 7 days (1 SB year ≈ 5.2 days, so 7 real days is a good taper)
-        const daysAfter=(ts-mayorData.electionClosing)/86400000;
-        const w=Math.max(0,1-daysAfter/7);
-        boost*=(1+(effect-1)*w);
-        if(Math.abs(effect-1)>0.05) reasons.push({event:'Mayor '+mayorData.currentMayor,mult:1+(effect-1)*w});
-      } else if(ts<=mayorData.electionClosing||!mayorData.electionClosing){
-        boost*=effect;
-        const reason=mayorData.perkReasons?.[tag];
-        if(reason) reasons.push({event:'Mayor perk: '+(reason[0]?.perk||''),mult:effect});
+    // Mayor effects
+    if (mayorData?.itemEffects?.[tag]) {
+      const eff = mayorData.itemEffects[tag];
+      if (mayorData.electionClosing > 0 && ts > mayorData.electionClosing) {
+        const daysAfter = (ts - mayorData.electionClosing) / 86400000;
+        const w = Math.max(0, 1 - daysAfter / 7);
+        boost += (eff - 1.0) * w;
+        if (Math.abs(eff-1) > 0.05 && w > 0.1) reasons.push('Mayor (fading)');
+      } else {
+        boost += eff - 1.0;
+        const r = mayorData.perkReasons?.[tag];
+        if (r?.length) reasons.push(r[0].perk);
       }
     }
-
-    // Future mayor prediction (if leading candidate wins)
-    if(mayorData?.futureItemEffects?.[tag]&&mayorData.electionClosing>0&&ts>mayorData.electionClosing){
-      const futEffect=mayorData.futureItemEffects[tag];
-      const daysAfter=(ts-mayorData.electionClosing)/86400000;
-      const w=Math.min(1,daysAfter/3); // ramps in over 3 days
-      boost*=(1+(futEffect-1)*w);
-      if(Math.abs(futEffect-1)>0.05) reasons.push({event:'Future mayor: '+mayorData.leadingCandidate,mult:futEffect});
+    // Future mayor
+    if (mayorData?.futureItemEffects?.[tag] && mayorData.electionClosing > 0 && ts > mayorData.electionClosing) {
+      const fe = mayorData.futureItemEffects[tag];
+      const daysAfter = (ts - mayorData.electionClosing) / 86400000;
+      const w = Math.min(1, daysAfter / 3);
+      boost += (fe - 1.0) * w;
+      if (Math.abs(fe-1) > 0.05 && w > 0.1) reasons.push('New mayor: '+mayorData.leadingCandidate);
     }
 
-    // Jacob contests (from API — actual future contests)
-    if(jacobContests?.length){
-      const CROP_IDS={
+    // Jacob contests
+    if (jacobContests?.length) {
+      const CROP_MAP = {
         'Wheat':'WHEAT','Carrot':'CARROT_ITEM','Potato':'POTATO_ITEM','Sugar Cane':'SUGAR_CANE',
         'Pumpkin':'PUMPKIN','Melon':'MELON','Cactus':'CACTUS','Cocoa Beans':'COCOA_BEANS',
-        'Mushroom':'MUSHROOM_COLLECTION','Nether Wart':'NETHER_STALK','Sunflower':'SUNFLOWER',
-        'Moonflower':'MOONFLOWER','Wild Rose':'WILD_ROSE',
+        'Mushroom':'MUSHROOM_COLLECTION','Nether Wart':'NETHER_STALK',
       };
-      for(const ct of jacobContests){
-        const window=3600000*3; // 3h window
-        if(ts>=ct.timestamp-window&&ts<=ct.timestamp+window+20*60000){
-          for(const cropName of (ct.cropNames||[])){
-            const id=CROP_IDS[cropName];
-            if(id){
-              const tagU=tag.toUpperCase();
-              if(tagU===id||tagU.startsWith(id.split('_')[0])){
-                boost*=1.30;
-                reasons.push({event:'Jacob: '+cropName,mult:1.30});
-              }
+      for (const ct of jacobContests) {
+        if (ts >= ct.timestamp - 10800000 && ts <= ct.timestamp + 1200000 + 10800000) {
+          for (const cropName of (ct.cropNames||[])) {
+            const id = CROP_MAP[cropName];
+            if (id && tag.toUpperCase().includes(id.split('_')[0])) {
+              boost += 0.30; reasons.push('Jacob: '+cropName);
             }
           }
         }
       }
     }
 
-    return {boost, reasons};
+    return { boost: Math.max(-0.5, Math.min(1.5, boost)), reasons };
   };
 
-  // ── 4. Project forward ──────────────────────────────────────────────────────
-  const result=[];
-  const recent5=prices.slice(-5);
-  const momentum0=recent5.length>1?(recent5[recent5.length-1]-recent5[0])/recent5.length:0;
-  const nowTs=last.t;
+  // ── Correlated random walk (Ornstein–Uhlenbeck style) ─────────────────────
+  // Each step: dP = -theta*(P-target)*dt + sigma*dW
+  // dW is correlated (not white noise) — use autoregressive noise
+  const dailyVol = stdDev / Math.sqrt(Math.max(1, 86400000 / intervalMs));
+  const stepVol  = dailyVol * Math.sqrt(stepMs / 86400000) * 0.5; // scaled to stepMs
 
-  let lastPrice=last.b||last.s||mean;
-  let momentum=momentum0;
-  let trendOffset=0;
-  let cyclePhase=((last.t-SB_EPOCH)%SB_YEAR_MS+SB_YEAR_MS)%SB_YEAR_MS/SB_YEAR_MS; // 0-1
+  // ── Project forward ────────────────────────────────────────────────────────
+  let lastPrice  = last.b || last.s || mean;
+  let momentum   = slopePerStep > 0 ? Math.min(slopePerStep * 3, stdDev * 0.02) : Math.max(slopePerStep * 3, -stdDev * 0.02);
+  let noiseCarry = 0; // correlated noise carry
+  let trendOffset = 0;
+  const result = [];
 
-  for(let i=1;i<=steps;i++){
-    const ts=last.t+i*stepMs;
-    trendOffset+=slopePerPoint; // long-term trend
-    momentum*=0.995;            // gentle decay per SkyBlock day (20 min step)
+  for (let i = 1; i <= steps; i++) {
+    const ts = last.t + i * stepMs;
+    trendOffset += slopePerStep;
 
-    // Seasonal pattern target
-    const phase=((ts-SB_EPOCH)%SB_YEAR_MS+SB_YEAR_MS)%SB_YEAR_MS/SB_YEAR_MS;
-    const bin=Math.min(NUM_BINS-1,Math.floor(phase*NUM_BINS));
-    const seasonal=pattern[bin];
+    // Seasonal target (if pattern is meaningful)
+    let seasonalMultiplier = 1.0;
+    if (usePattern) {
+      const phase = ((ts - SB_EPOCH) % SB_YEAR_MS + SB_YEAR_MS) % SB_YEAR_MS / SB_YEAR_MS;
+      const bin   = Math.min(NUM_BINS-1, Math.floor(phase * NUM_BINS));
+      seasonalMultiplier = pattern[bin];
+    }
 
-    // Detected cycle contribution
-    const cycleContrib = bestCycleLen>0
-      ? cycleAmp*Math.sin(2*Math.PI*i/bestCycleLen)
-      : 0;
+    // Cyclic component (sine wave at detected cycle frequency)
+    const cyclicComponent = cycleAmp * Math.sin(2 * Math.PI * i / Math.max(1, bestCycleSteps) + cyclePhaseOffset);
 
-    // Event adjustment
-    const {boost, reasons}=getEventBoost(ts, nowTs);
+    // Event boost
+    const { boost, reasons } = getEventInfo(ts);
+    const eventMultiplier = 1.0 + boost;
 
-    // Target = (mean+trend) × seasonal × event_boost + cycle
-    const baseMean=mean+trendOffset;
-    const target=baseMean*seasonal*boost+cycleContrib;
+    // Target = (mean + trend) × seasonal × event + cycle
+    const baseMean = mean + trendOffset;
+    const target   = baseMean * seasonalMultiplier * eventMultiplier + cyclicComponent;
 
-    // Mean reversion pull (stronger when price far from target)
-    const dist=target-lastPrice;
-    const pullStrength=Math.min(0.008, 0.002+Math.abs(dist/mean)*0.01); // per 20-min step
-    const pull=dist*pullStrength;
+    // Mean-reversion pull (proportional to distance)
+    const dist = target - lastPrice;
+    const pullStrength = Math.min(0.12, 0.04 + Math.abs(dist / Math.max(mean, 1)) * 0.15);
+    const pull = dist * pullStrength;
 
-    // Volatility-scaled noise (proportional to recent vol)
-    const noise=(Math.random()-0.5)*stdDev*0.003; // per 20-min step
+    // Correlated noise (AR(1) with rho=0.7)
+    const rho = 0.7;
+    noiseCarry = rho * noiseCarry + (1-rho) * (Math.random()-0.5) * 2 * stepVol;
 
-    lastPrice=lastPrice+momentum+pull+noise;
-    if(lastPrice>0 && i % outputEvery === 0) {
+    // Momentum decay
+    momentum *= 0.92;
+
+    lastPrice = lastPrice + pull + momentum + noiseCarry;
+    if (lastPrice <= 0) lastPrice = mean * 0.5;
+
+    if (i % outputEvery === 0) {
       result.push({
-        t:ts, b:r1(lastPrice), s:r1(lastPrice*0.97),
-        eventMult:r2(seasonal*boost),
-        reasons: reasons.length>0 ? reasons.map(r=>r.event).slice(0,2) : undefined,
+        t: ts,
+        b: r1(lastPrice),
+        s: r1(lastPrice * 0.97),
+        eventMult: r2(seasonalMultiplier * eventMultiplier),
+        reasons: reasons.length > 0 ? reasons.slice(0, 2) : undefined,
       });
     }
   }
