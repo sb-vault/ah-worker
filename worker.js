@@ -171,12 +171,16 @@ async function refreshMayor(env) {
   }
 
   // Voting closes = raw.current?.closing, mayor takes effect 1 SB year later
-  // raw.current.closing is the exact ms timestamp when election ends
-  // Fall back to SB year computation if not present
+  // raw.current.closing = when voting closes
+  // New mayor takes effect ~24h after voting closes (1d7h gap but empirically 24h)
   const rawClosing = raw.current?.closing || 0;
+  const MAYOR_EFFECT_DELAY = 24 * 3600000; // 24h after voting closes
   const sbYearsElapsed = Math.floor((Date.now() - SB_EPOCH) / SB_YEAR_MS);
   const computedClose = SB_EPOCH + (sbYearsElapsed + 1) * SB_YEAR_MS;
-  const votingCloses = rawClosing > Date.now() ? rawClosing : computedClose;
+  // votingCloses = when you can no longer vote
+  const votingCloses = rawClosing > Date.now() ? rawClosing : (computedClose - MAYOR_EFFECT_DELAY);
+  // mayorEffectTs = when new mayor actually takes effect (shown in-game)
+  const mayorEffectTs = votingCloses + MAYOR_EFFECT_DELAY;
 
   const data = {
     success: true, ts: Date.now(),
@@ -184,7 +188,8 @@ async function refreshMayor(env) {
     currentPerks: mayorPerks,
     ministerName, ministerPerk,
     votingCloses,
-    nextMayorTs: votingCloses > 0 ? votingCloses + SB_YEAR_MS : 0,
+    mayorEffectTs,   // when new mayor ACTUALLY takes effect (shown in-game)
+    nextMayorTs: mayorEffectTs,  // alias used by prediction engine
     affectedItems,     // { ITEM_ID: priceMultiplier }
     candidates: (raw.current?.candidates || []).map(c => ({
       name: c.name, votes: c.votes||0,
