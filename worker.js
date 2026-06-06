@@ -33,6 +33,11 @@ export default {
       return handleMayor(env, ctx);
     }
 
+    if (url.pathname === '/events') {
+      const events = getUpcomingEvents(Date.now());
+      return json({ success: true, ts: Date.now(), events });
+    }
+
     if (url.pathname === '/lastUpdated') {
       if (env.FLIPPER_CACHE) {
         const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
@@ -359,7 +364,7 @@ function computeAnalytics(points, mayorData, itemId) {
   }
 
   // Extrapolation: 30 days forward using multiple models
-  const extrapolation = extrapolateAdvanced(points, 30, intervalMs);
+  const extrapolation = extrapolateAdvanced(points, 30, intervalMs, itemId);
 
   return {
     mean: r1(mean), median: r1(median), min: r1(min), max: r1(max),
@@ -460,34 +465,93 @@ function getMayorImpact(mayor) {
   return impacts[mayor] || [];
 }
 
-// ── Advanced extrapolation ────────────────────────────────────────────────────
-// Uses linear regression + seasonality + mean-reversion to project prices
-function extrapolateAdvanced(points, futureDays, intervalMs) {
-  if (points.length < 5) return [];
-  const prices = points.map(p => p.b || p.s).filter(v => v > 0);
-  const last   = points[points.length - 1];
+// ── Advanced multi-model extrapolation ───────────────────────────────────────
+// Uses 4 models blended together:
+//  1. Linear trend (short + long term)
+//  2. Mean reversion (price pulls toward historical mean)
+//  3. Seasonal/cyclical component (detects repeating patterns in the data)
+//  4. Event-driven impulse (adds price spikes at known event times)
+function extrapolateAdvanced(points, futureDays, intervalMs, itemId) {
+  if (points.length < 10) return [];
+  const prices   = points.map(p => p.b || p.s).filter(v => v > 0);
+  if (prices.length < 10) return [];
+  const last     = points[points.length - 1];
+  const n        = prices.length;
+  const mean     = prices.reduce((a,b) => a+b, 0) / n;
+  const current  = prices[n-1];
 
-  // Short-term trend (last 48 pts)
-  const shortSlope = linearSlope(prices.slice(-Math.min(48, prices.length)));
-  // Long-term trend (all data)
+  // Model 1: Trend (blend short 48pt and long-term)
+  const shortSlope = linearSlope(prices.slice(-Math.min(48, n)));
   const longSlope  = linearSlope(prices);
+  const trendSlope = shortSlope * 0.6 + longSlope * 0.4;
 
-  // Blend: mostly short-term but pulled toward long-term
-  const blendedSlope = shortSlope * 0.7 + longSlope * 0.3;
+  // Model 2: Mean reversion strength (stronger when far from mean)
+  const reversionStrength = 0.015; // 1.5% pull per interval
+  const distFromMean = mean - current;
 
-  // Mean reversion force: pull toward historical mean
-  const mean     = prices.reduce((a,b) => a+b, 0) / prices.length;
-  const current  = prices[prices.length - 1];
-  const reversion = (mean - current) * 0.02; // 2% per interval toward mean
+  // Model 3: Cyclical component — detect dominant cycle length
+  // Use autocorrelation to find if there's a repeating pattern
+  let cyclePeriod = 0, cycleAmplitude = 0;
+  if (n >= 48) {
+    // Check for daily (24h) cycle — common in bazaar (Jacob's every 60 min = 24 times/day irl)
+    const dayPeriod = Math.round(3600000 / Math.max(intervalMs, 1000));
+    if (dayPeriod > 0 && dayPeriod < n) {
+      let correlation = 0;
+      for (let i = dayPeriod; i < Math.min(n, dayPeriod * 3); i++) {
+        correlation += (prices[i] - mean) * (prices[i - dayPeriod] - mean);
+      }
+      const variance = prices.reduce((s,p) => s+(p-mean)**2, 0) / n;
+      const normalizedCorr = variance > 0 ? correlation / ((n - dayPeriod) * variance) : 0;
+      if (Math.abs(normalizedCorr) > 0.3) {
+        cyclePeriod    = dayPeriod;
+        cycleAmplitude = Math.sqrt(variance) * normalizedCorr * 0.5;
+      }
+    }
+  }
 
-  const steps = Math.round((futureDays * 86400000) / intervalMs);
-  const result = [];
-  let price = current;
+  // Model 4: Event impulses for the future
+  // Pre-calculate event boost multipliers for each future time step
+  const now = last.t;
+
+  const steps   = Math.round((futureDays * 86400000) / intervalMs);
+  const result  = [];
+  let price     = current;
 
   for (let i = 1; i <= steps; i++) {
-    price += blendedSlope + reversion * Math.exp(-i * 0.01); // decay reversion over time
-    if (price < 0) price = 0.01;
-    result.push({ t: last.t + i * intervalMs, b: r1(price) });
+    const futureT = now + i * intervalMs;
+
+    // Trend component
+    const trend = trendSlope;
+
+    // Mean reversion: exponentially decaying pull toward mean
+    const reversion = distFromMean * reversionStrength * Math.exp(-i * 0.005);
+
+    // Cyclical component
+    const cycle = cyclePeriod > 0
+      ? cycleAmplitude * Math.sin((2 * Math.PI * i) / cyclePeriod)
+      : 0;
+
+    // Event impulse: get boost for items affected by upcoming events
+    let eventImpulse = 0;
+    if (itemId) {
+      const boost = getEventBoost(itemId, futureT);
+      if (boost.score > 0) {
+        // Convert score to price % change impulse
+        eventImpulse = price * boost.score * 0.005; // 0.5% per score point
+      } else if (boost.score < 0) {
+        eventImpulse = price * boost.score * 0.003; // sell-off is gentler
+      }
+    }
+
+    // Volatility noise (small random-ish component based on historical std)
+    // Use deterministic pseudo-noise based on position (not truly random, for consistency)
+    const stdDev  = Math.sqrt(prices.reduce((s,p) => s+(p-mean)**2, 0) / n);
+    const noise   = stdDev * 0.05 * Math.sin(i * 2.39996); // golden angle oscillation
+
+    price = price + trend + reversion + cycle + eventImpulse + noise;
+    if (price < 1) price = 1;
+
+    result.push({ t: futureT, b: r1(price) });
   }
   return result;
 }
@@ -567,13 +631,15 @@ async function refreshMayor(env) {
     success: true, ts: Date.now(),
     currentMayor:   currentMayorName,
     currentPerks:   raw.mayor?.perks?.map(p => p.name) || [],
-    nextElectionTs: votingCloseTs,   // when voting closes
-    mayorChangeTs:  mayorChangeTs,   // when new mayor actually takes effect
+    nextElectionTs: votingCloseTs,
+    mayorChangeTs:  mayorChangeTs,
     candidates,
     mayorImpact,
-    // Items that WILL benefit from likely next mayor
     nextMayorImpact: candidates.length > 0 ? candidates[0].impact : [],
     nextMayorName:   candidates.length > 0 ? candidates[0].name   : null,
+    // Upcoming SkyBlock events (next 2 SB years)
+    upcomingEvents:  getUpcomingEvents(Date.now(), SB_YEAR_MS * 2),
+    sbTime: getSkyBlockTime(Date.now()),
   };
 
   if (env?.FLIPPER_CACHE)
