@@ -1,58 +1,114 @@
-// sb-flipper Investment Worker v3
-// Full event-aware prediction engine
+// sb-flipper Investment Worker v4 — comprehensive event-aware prediction
 
-const BZ_KEY    = 'bz_invest_v3';
-const MAYOR_KEY = 'mayor_v3';
+const BZ_KEY    = 'bz_v4';
+const MAYOR_KEY = 'mayor_v4';
 const KV_TTL    = 130;
 
-// SkyBlock constants
-const SB_EPOCH   = 1560272700000;
-const SB_YEAR_MS = 124 * 3600000;  // 124 real hours per SB year
-const SB_DAY_MS  = SB_YEAR_MS / 372; // 372 SB days per year
+// ── SkyBlock calendar constants ───────────────────────────────────────────────
+const SB_EPOCH   = 1560272700000; // June 11 2019 ~17:05 UTC
+const SB_YEAR_MS = 446400000;     // 124 real hours × 3600000
+const SB_DAY_MS  = 1200000;       // 20 real minutes per SkyBlock day
+// SkyBlock months: 12 months × 31 days = 372 days
+// Months: Early Spring(1-31), Spring(32-62), Late Spring(63-93),
+//         Early Summer(94-124), Summer(125-155), Late Summer(156-186),
+//         Early Autumn(187-217), Autumn(218-248), Late Autumn(249-279),
+//         Early Winter(280-310), Winter(311-341), Late Winter(342-372)
+const SB_MONTH_NAMES = ['Early Spring','Spring','Late Spring','Early Summer','Summer','Late Summer','Early Autumn','Autumn','Late Autumn','Early Winter','Winter','Late Winter'];
 
-// ── Event schedule (SB days within a year) ───────────────────────────────────
-// SkyBlock year has Early Spring (1) through Late Winter (31) × 12 months
-// Events occur at fixed SB calendar positions each year
-const ANNUAL_EVENTS = [
-  { name:'Spooky Festival',  sbDayStart: 298, sbDayEnd: 301, items:['CANDY','GREEN_CANDY','PURPLE_CANDY','JACK_O_LANTERN','SPOOKY_FRAGMENT'], effect: 1.4 },
-  { name:'Fishing Festival', sbDayStart: 91,  sbDayEnd: 94,  items:['FISH','RAW_FISH','TROPHY_FISH','DOLPHIN_PET'], effect: 1.2 },
-  { name:'Season of Jerry',  sbDayStart: 329, sbDayEnd: 341, items:['JERRY_BOX','BLUE_JERRY','GREEN_JERRY','PURPLE_JERRY','GOLDEN_JERRY'], effect: 1.5 },
-  { name:'New Year',         sbDayStart: 359, sbDayEnd: 361, items:['NEW_YEAR_CAKE','CAKE_BAG'], effect: 1.3 },
-  { name:'Mining Fiesta',    sbDayStart: 147, sbDayEnd: 150, items:['MITHRIL','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','EMERALD'], effect: 0.85 },
+function sbDayOfYear(ts) {
+  const elapsed = ((ts - SB_EPOCH) % SB_YEAR_MS + SB_YEAR_MS) % SB_YEAR_MS;
+  return Math.floor(elapsed / SB_DAY_MS) + 1; // 1-372
+}
+function sbYearNum(ts) { return Math.floor((ts - SB_EPOCH) / SB_YEAR_MS); }
+function sbYearStart(ts) { return SB_EPOCH + sbYearNum(ts) * SB_YEAR_MS; }
+
+// ── Fixed annual events (day range within SkyBlock year, 1-indexed) ───────────
+// Spooky: Autumn 29-31 = days 218+28..218+30 = 246-248
+// Pre-spooky hype: Fear Mongerer from Autumn 26 = day 243
+// Fishing Festival: Early Spring 1-3 = days 1-3 (Marina mayor required, but also base)
+// Season of Jerry: Late Winter 1-22 = days 342-363 (approx)
+// New Year: Late Winter 29-31 = days 370-372
+// Mining Fiesta: only when Cole/Foxy (handled via perks)
+// Bank Interest: 1st of every month (every 31 days starting day 1)
+// Dark Auction: every 3 real days = every 216 SB days (but 124 per year = every ~3 SB days)
+// Traveling Zoo: every 124/6 ≈ 20.7 SB days
+
+const FIXED_EVENTS = [
+  // { name, startDay, endDay, itemPatterns, demandMultiplier }
+  { name:'Spooky Festival',     start:243, end:251,
+    items:['CANDY','GREEN_CANDY','PURPLE_CANDY','JACK_O_LANTERN','SPOOKY_FRAGMENT','BAT_ARTIFACT','BAT_RING','INTIMIDATION_ARTIFACT','ECTOPLASM','PUMPKIN'],
+    mult:1.5, spikeAt:246, spikeMult:1.8 },
+  { name:'Pre-Spooky Prep',     start:235, end:243,
+    items:['CANDY','GREEN_CANDY','PURPLE_CANDY'],
+    mult:1.2 },
+  { name:'Season of Jerry',     start:342, end:363,
+    items:['JERRY_BOX','BLUE_JERRY','GREEN_JERRY','PURPLE_JERRY','GOLDEN_JERRY','SNOWBALL'],
+    mult:1.6 },
+  { name:'New Year',            start:365, end:372,
+    items:['NEW_YEAR_CAKE','CAKE_BAG'],
+    mult:1.4 },
+  { name:'New Year Prep',       start:358, end:365,
+    items:['NEW_YEAR_CAKE','CAKE_BAG'],
+    mult:1.2 },
+  { name:'Traveling Zoo',       start:1, end:3,   // approximation, repeats ~6x/year
+    items:['ORINGO','ZOO_TICKET'],
+    mult:1.15 },
+  { name:'Late Winter Fishing', start:342, end:372,
+    items:['JERRY_FISHING','ICE_BAIT','FROZEN_STEVE'],
+    mult:1.3 },
 ];
 
-// ── Mayor/minister perks → market effects ────────────────────────────────────
-const PERK_EFFECTS = {
-  // Farming perks → crop supply UP → prices DOWN
-  'GOATed':           { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','PUMPKIN','SUGAR_CANE','MELON','MUSHROOM_COLLECTION','CACTUS','COCOA_BEANS','NETHER_STALK'], effect: 0.88 },
-  'Blooming Business':{ items:['WHEAT','POTATO_ITEM','CARROT_ITEM','SUGAR_CANE','PUMPKIN','MELON'], effect: 0.90 },
-  'Pelt-pocalypse':   { items:['FUR','PELT'], effect: 0.85 },
-  'Pest Eradicator':  { items:['ENCHANTED_COOKIE','COMPOSTER_UPGRADE','PESTICIDE'], effect: 0.90 },
-  // Mining perks → ore supply UP → prices DOWN
-  'Prospection':      { items:['MITHRIL','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','EMERALD','GEMSTONE_POWDER'], effect: 0.85 },
-  'Mining Fiesta':    { items:['MITHRIL','COBBLESTONE','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND'], effect: 0.80 },
-  'Molten Forge':     { items:['ENCHANTED_IRON','ENCHANTED_GOLD','ENCHANTED_DIAMOND','HARD_STONE'], effect: 0.87 },
-  // Fishing perks → fish/sea supply UP → prices DOWN
-  'Fishing Festival': { items:['RAW_FISH','PRISMARINE_SHARD','SHARK_FIN','SQUUID_HAT','SPONGE','FISHING_EXPERIENCE_BOTTLE'], effect: 0.85 },
-  'Luck of the Sea 2.0':{ items:['RAW_FISH','TROPHY_FISH','DOLPHIN_PET'], effect: 0.88 },
-  // Slayer perks → slayer mats UP → prices DOWN
-  'SLASHED Pricing':  { items:['CORRUPTED_FRAGMENT','WITHER_ESSENCE','SPIDER_CATALYST','REVENANT_FLESH','SADAN_BROOCH'], effect: 0.88 },
-  'Pathfinder':       { items:['REVENANT_FLESH','TARANTULA_SILK','VOIDLING_NUCLEUS','WOLF_TOOTH'], effect: 0.90 },
-  // Special mayor effects
-  'Mythological Ritual':{ items:['GRIFFIN_FEATHER','MINOS_RELIC','CHIMERA','FLAWED_DIAMOND_GEM','MAGICAL_MUSHROOM_SOUP'], effect: 1.35 },
-  'Darker Auctions':  { items:['SCYTHE_BLADE','WITHER_BLOOD','SHADOW_ASSASSIN_CLOAK','SHADOW_FURY'], effect: 1.25 },
-  'Shopping Spree':   { items:['BOOSTER_COOKIE','DUNGEON_ORBS','BEACON'], effect: 1.15 },
-  'Volume Trading':   { items:['BOOSTER_COOKIE','DARK_CACAO_TRUFFLE'], effect: 1.20 },
-  'Extra Event':      { items:['CANDY','GREEN_CANDY','PURPLE_CANDY','FISHING_EXPERIENCE_BOTTLE','MITHRIL'], effect: 1.15 },
-  // Derpy (special) — doubles XP → doubles demand for XP items
-  'Turbo-Minions I':  { items:['ENCHANTED_EGG','SUPER_EGG','OAK_LOG'], effect: 1.3 },
+// ── Perk → market effects ─────────────────────────────────────────────────────
+// Maps perk NAME → { items: [...], supplyChange: +1.0 = +100% supply, priceEffect: multiply }
+// Supply UP → price DOWN. Demand UP → price UP.
+const PERK_MARKET = {
+  // ── FARMING PERKS (supply↑ → price↓) ─────────────────────────────────────
+  'GOATed':             { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','SUGAR_CANE','PUMPKIN','MELON','CACTUS','COCOA_BEANS','NETHER_STALK','MUSHROOM_COLLECTION','SUNFLOWER','MOONFLOWER'], price:0.82 },
+  'Blooming Business':  { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','SUGAR_CANE','PUMPKIN','MELON','ENCHANTED_CARROT','ENCHANTED_POTATO','ENCHANTED_WHEAT'], price:0.85 },
+  'Pest Eradicator':    { items:['ENCHANTED_COOKIE','COMPOSTER_UPGRADE','PESTICIDE','WHEAT','CARROT_ITEM'], price:0.88 },
+  'Pelt-pocalypse':     { items:['FUR','PELT','RABBIT_FOOT'], price:0.80 },
+  'Grand Feast':        { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','MUSHROOM_COLLECTION'], price:0.90 }, // Finnegan special
+
+  // ── MINING PERKS (supply↑ → price↓) ──────────────────────────────────────
+  'Prospection':        { items:['MITHRIL_ORE','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','EMERALD','LAPIS_LAZULI','REDSTONE','QUARTZ','GEMSTONE'], price:0.82 },
+  'Mining Fiesta':      { items:['MITHRIL_ORE','COBBLESTONE','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','HARD_STONE'], price:0.75, tempDuration:0.02 }, // ~2% of year
+  'Molten Forge':       { items:['ENCHANTED_IRON_BLOCK','ENCHANTED_GOLD_BLOCK','ENCHANTED_DIAMOND','HARD_STONE','HOT_STUFF'], price:0.84 },
+
+  // ── FISHING PERKS (supply↑ → price↓ for fish, demand↑ for equipment) ─────
+  'Fishing Festival':   { items:['RAW_FISH','SPONGE','SHARK_FIN','DOLPHIN','SEA_CREATURE_BAIT','FISHING_BAIT'], price:0.80, tempDuration:0.024 },
+  'Luck of the Sea 2.0':{ items:['RAW_FISH','TROPHY_FISH','SEA_CREATURE_BAIT'], price:0.88 },
+
+  // ── SLAYER PERKS (supply↑ → price↓ for slayer drops) ─────────────────────
+  'SLASHED Pricing':    { items:['CORRUPTED_FRAGMENT','WITHER_ESSENCE','SPIDER_CATALYST','REVENANT_FLESH'], price:0.85 },
+  'Pathfinder':         { items:['REVENANT_FLESH','TARANTULA_SILK','WOLF_TOOTH','VOIDLING_NUCLEUS'], price:0.88 },
+  'Slayer XP Buff':     { items:['REVENANT_FLESH','TARANTULA_SILK','WOLF_TOOTH','SADAN_BROOCH'], price:0.90 },
+
+  // ── DEMAND PERKS (demand↑ → price↑) ──────────────────────────────────────
+  'Mythological Ritual':{ items:['GRIFFIN_FEATHER','MINOS_RELIC','CHIMERA','MAGICAL_MUSHROOM_SOUP','ANCIENT_CLAW','MINOTAUR_PET','GRIFFIN_PET'], price:1.45 },
+  'Darker Auctions':    { items:['SCYTHE_BLADE','WITHER_BLOOD','SHADOW_ASSASSIN_CLOAK','SHADOW_FURY','DARK_CACAO_TRUFFLE'], price:1.30 },
+  'Shopping Spree':     { items:['BOOSTER_COOKIE','DUNGEON_ORBS','BEACON','BITS'], price:1.20 },
+  'Volume Trading':     { items:['BOOSTER_COOKIE','DARK_CACAO_TRUFFLE','STOCK_OF_STONKS'], price:1.25 },
+  'Extra Event':        { items:['CANDY','GREEN_CANDY','PURPLE_CANDY','RAW_FISH','MITHRIL_ORE'], price:1.20 },
+  'Pet XP Buff':        { items:['PET_ITEM_TIER_BOOST','EXP_BOTTLE','GRAND_EXP_BOTTLE','TITANIC_EXP_BOTTLE'], price:1.15 },
+  'Sharing is Caring':  { items:['PET_ITEM_TIER_BOOST','EXP_BOTTLE','GRAND_EXP_BOTTLE'], price:1.12 },
+
+  // ── SPECIAL MAYOR EFFECTS ─────────────────────────────────────────────────
+  // Derpy: doubles XP → huge demand for XP-boosting items
+  'Turbo-Minions I':    { items:['ENCHANTED_EGG','SUPER_EGG','OAK_LOG','BIRCH_LOG'], price:1.35 },
+  'Mayor XP Buff':      { items:['GRAND_EXP_BOTTLE','TITANIC_EXP_BOTTLE','CORRUPTED_FRAGMENT'], price:1.40 },
+  // Scorpius: dark auction items spike
+  'Bribe':              { items:['SCYTHE_BLADE','WITHER_BLOOD','SHADOW_FURY'], price:1.20 },
+  // Foxy
+  'Sweet Benevolence':  { items:['CARNIVAL_TICKET','CARNIVAL_MASK','PARTY_HAT_CINNAMON'], price:1.30 },
+  'Chivalrous Carnival':{ items:['CARNIVAL_TICKET','CARNIVAL_MASK'], price:1.25 },
+  // Diaz: trading doubles
+  'Stock Exchange':     { items:['STOCK_OF_STONKS','BOOSTER_COOKIE'], price:1.15 },
 };
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (request.method === 'OPTIONS') return new Response(null, { headers: cors() });
-
+    if (request.method === 'OPTIONS') return new Response(null, {headers:cors()});
     if (url.pathname === '/bazaar')      return serveBazaar(env, ctx);
     if (url.pathname === '/mayor')       return serveMayor(env, ctx);
     if (url.pathname === '/lastUpdated') return serveLastUpdated(env);
@@ -62,22 +118,20 @@ export default {
       return handleHistory(tag, period, env, ctx);
     }
     if (url.pathname === '/refresh') {
-      if (!env.FLIPPER_CACHE) return json({ success:false, error:'KV not bound' });
-      try {
-        await Promise.all([refreshBazaar(env), refreshMayor(env)]);
-        return json({ success:true, message:'Refreshed' });
-      } catch(e) { return json({ success:false, error:e.message }); }
+      if (!env.FLIPPER_CACHE) return json({success:false,error:'KV not bound'});
+      try { await Promise.all([refreshBazaar(env), refreshMayor(env)]); return json({success:true}); }
+      catch(e) { return json({success:false,error:e.message}); }
     }
     if (url.pathname === '/debug') {
       const hasKV = !!env.FLIPPER_CACHE;
       let bz='N/A', m='N/A';
       if (hasKV) {
-        try { const v=await env.FLIPPER_CACHE.get(BZ_KEY); bz=v?`${v.length} chars`:'EMPTY'; } catch(e){bz=e.message;}
-        try { const v=await env.FLIPPER_CACHE.get(MAYOR_KEY); m=v?`${v.length} chars`:'EMPTY'; } catch(e){m=e.message;}
+        try { const v=await env.FLIPPER_CACHE.get(BZ_KEY); bz=v?v.length+'c':'EMPTY'; } catch(e){ bz=e.message; }
+        try { const v=await env.FLIPPER_CACHE.get(MAYOR_KEY); m=v?v.length+'c':'EMPTY'; } catch(e){ m=e.message; }
       }
-      return json({ kvBound:hasKV, bazaarCache:bz, mayorCache:m });
+      return json({kvBound:hasKV, bazaarCache:bz, mayorCache:m});
     }
-    return json({ error:'Not found', routes:['/bazaar','/history/{tag}?period=hour|day|week|month|month3|month6','/mayor','/lastUpdated','/refresh','/debug'] }, 404);
+    return json({error:'Not found',routes:['/bazaar','/history/{tag}','/mayor','/lastUpdated','/refresh','/debug']},404);
   },
   async scheduled(event, env, ctx) {
     ctx.waitUntil(Promise.all([refreshBazaar(env), refreshMayor(env)]));
@@ -85,411 +139,427 @@ export default {
 };
 
 // ── Bazaar snapshot ───────────────────────────────────────────────────────────
-
 async function serveBazaar(env, ctx) {
-  if (env.FLIPPER_CACHE) {
-    const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type:'json' });
-    if (c) return json({ ...c, cached:true });
-  }
+  if (env.FLIPPER_CACHE) { const c=await env.FLIPPER_CACHE.get(BZ_KEY,{type:'json'}); if(c) return json({...c,cached:true}); }
   ctx.waitUntil(refreshBazaar(env));
-  return json({ success:true, loading:true, products:[], lastUpdated:0, ts:Date.now() });
+  return json({success:true,loading:true,products:[],lastUpdated:0,ts:Date.now()});
 }
-
 async function refreshBazaar(env) {
   try {
-    const r = await fetch('https://api.hypixel.net/v2/skyblock/bazaar', { headers:{ 'User-Agent':'sb-flipper/1.0' } });
+    const r = await fetch('https://api.hypixel.net/v2/skyblock/bazaar',{headers:{'User-Agent':'sb-flipper/1.0'}});
     if (!r.ok) throw new Error('Hypixel '+r.status);
     const raw = await r.json();
-
     const products = [];
-    for (const [id, p] of Object.entries(raw.products || {})) {
-      const qs = p.quick_status;
-      if (!qs || qs.buyPrice <= 0) continue;
-      const buyP = qs.buyPrice, sellP = qs.sellPrice;
-      const buyW = qs.buyMovingWeek || 0, sellW = qs.sellMovingWeek || 0;
-      const buySummary  = (p.buy_summary  || []).slice(0,8).map(o=>({ a:Math.round(o.amount), p:r1(o.pricePerUnit), n:o.orders }));
-      const sellSummary = (p.sell_summary || []).slice(0,8).map(o=>({ a:Math.round(o.amount), p:r1(o.pricePerUnit), n:o.orders }));
-      const topBuy = buySummary[0]?.p || 0, topSell = sellSummary[0]?.p || 0;
-      const spread = topSell > 0 && topBuy > 0 ? topSell - topBuy : 0;
-      const spreadPct = topBuy > 0 ? (spread/topBuy)*100 : 0;
-      const weeklyCoins = Math.min(buyW,sellW)*((buyP+sellP)/2);
-      products.push({
-        id,
-        buyP:r1(buyP), sellP:r1(sellP), topBuy:r1(topBuy), topSell:r1(topSell),
-        spread:r1(spread), spreadPct:r2(spreadPct),
-        buyW, sellW,
+    for (const [id,p] of Object.entries(raw.products||{})) {
+      const qs=p.quick_status; if(!qs||qs.buyPrice<=0) continue;
+      const bS=(p.buy_summary||[]).slice(0,8).map(o=>({a:Math.round(o.amount),p:r1(o.pricePerUnit),n:o.orders}));
+      const sS=(p.sell_summary||[]).slice(0,8).map(o=>({a:Math.round(o.amount),p:r1(o.pricePerUnit),n:o.orders}));
+      products.push({id, buyP:r1(qs.buyPrice), sellP:r1(qs.sellPrice),
+        topBuy:r1(bS[0]?.p||0), topSell:r1(sS[0]?.p||0),
+        spread:r1((sS[0]?.p||0)-(bS[0]?.p||0)),
+        spreadPct:r2(qs.buyPrice>0?(((sS[0]?.p||0)-(bS[0]?.p||0))/qs.buyPrice*100):0),
+        buyW:qs.buyMovingWeek||0, sellW:qs.sellMovingWeek||0,
         sellVol:qs.sellVolume||0, buyVol:qs.buyVolume||0,
         sellOrders:qs.sellOrders||0, buyOrders:qs.buyOrders||0,
-        weeklyCoins:Math.round(weeklyCoins),
-        buyDepth:  buySummary.reduce((s,o)=>s+o.a,0),
-        sellDepth: sellSummary.reduce((s,o)=>s+o.a,0),
-        momentum: r2(Math.log(Math.max(buyW,1)/Math.max(sellW,1))/Math.log(2)),
-        buySummary, sellSummary,
-      });
+        weeklyCoins:Math.round(Math.min(qs.buyMovingWeek,qs.sellMovingWeek)*((qs.buyPrice+qs.sellPrice)/2)),
+        buyDepth:bS.reduce((s,o)=>s+o.a,0), sellDepth:sS.reduce((s,o)=>s+o.a,0),
+        momentum:r2(Math.log(Math.max(qs.buyMovingWeek,1)/Math.max(qs.sellMovingWeek,1))/Math.log(2)),
+        buySummary:bS, sellSummary:sS });
     }
-    const data = { success:true, ts:Date.now(), lastUpdated:raw.lastUpdated, count:products.length, products };
-    await env.FLIPPER_CACHE.put(BZ_KEY, JSON.stringify(data), { expirationTtl:KV_TTL });
-    console.log('Bazaar: '+products.length);
-  } catch(e) { console.error('Bazaar:',e.message); }
+    const data={success:true,ts:Date.now(),lastUpdated:raw.lastUpdated,count:products.length,products};
+    await env.FLIPPER_CACHE.put(BZ_KEY,JSON.stringify(data),{expirationTtl:KV_TTL});
+    console.log('Bazaar:'+products.length);
+  } catch(e){ console.error('Bazaar:',e.message); }
 }
 
 // ── Mayor ─────────────────────────────────────────────────────────────────────
-
 async function serveMayor(env, ctx) {
   if (env.FLIPPER_CACHE) {
-    const c = await env.FLIPPER_CACHE.get(MAYOR_KEY, { type:'json' });
-    if (c && Date.now()-(c.ts||0) < 300000) return json({ ...c, cached:true });
+    const c=await env.FLIPPER_CACHE.get(MAYOR_KEY,{type:'json'});
+    if (c&&Date.now()-(c.ts||0)<60000) return json({...c,cached:true});
   }
-  try {
-    const data = await refreshMayor(env);
-    return json(data);
-  } catch(e) { return json({ success:false, error:e.message }); }
+  try { return json(await refreshMayor(env)); }
+  catch(e) { return json({success:false,error:e.message}); }
 }
-
 async function refreshMayor(env) {
-  const r = await fetch('https://api.hypixel.net/resources/skyblock/election', { headers:{'User-Agent':'sb-flipper/1.0'} });
+  const r = await fetch('https://api.hypixel.net/resources/skyblock/election',{headers:{'User-Agent':'sb-flipper/1.0'}});
   if (!r.ok) throw new Error('election '+r.status);
   const raw = await r.json();
 
   const mayorName    = raw.mayor?.name || 'Unknown';
-  const mayorPerks   = (raw.mayor?.perks || []).map(p => p.name);
+  const mayorPerks   = (raw.mayor?.perks||[]).map(p=>p.name);
   const ministerName = raw.mayor?.minister?.candidate?.name || null;
   const ministerPerk = raw.mayor?.minister?.perk?.name || null;
 
-  // Build affected items from mayor + minister perks
-  const allPerks = [...mayorPerks];
-  if (ministerPerk) allPerks.push(ministerPerk);
+  // All active perks (mayor + minister)
+  const activePerks = [...mayorPerks];
+  if (ministerPerk) activePerks.push(ministerPerk);
 
-  const affectedItems = {};
-  for (const perk of allPerks) {
-    const effect = PERK_EFFECTS[perk];
-    if (effect) {
-      for (const item of effect.items) {
-        affectedItems[item] = (affectedItems[item] || 1) * effect.effect;
-      }
+  // Build per-item price multipliers from all active perks
+  const itemEffects = {};
+  const perkReasons = {}; // item → which perk caused it
+  for (const perk of activePerks) {
+    const effect = PERK_MARKET[perk];
+    if (!effect) continue;
+    for (const item of effect.items) {
+      const prev = itemEffects[item] || 1.0;
+      itemEffects[item] = prev * effect.price;
+      perkReasons[item] = (perkReasons[item]||[]);
+      perkReasons[item].push({perk, price:effect.price});
     }
   }
 
-  // Voting closes = raw.current?.closing, mayor takes effect 1 SB year later
-  // raw.current.closing is EXACTLY what Hypixel shows in-game as election end
-  // Do NOT add or subtract anything — use it directly
-  const rawClosing = raw.current?.closing || 0;
-  // Fallback: compute from SB epoch if API doesn't give it
-  const sbYearsElapsed = Math.floor((Date.now() - SB_EPOCH) / SB_YEAR_MS);
-  // Election ends at Late Spring 27 = 93/124 through the SkyBlock year
-  // That's 0.75 through the year (93 hours into 124 hour year)
-  const sbYearStart = SB_EPOCH + sbYearsElapsed * SB_YEAR_MS;
-  const computedClose = sbYearStart + Math.round(0.75 * SB_YEAR_MS); // Late Spring 27
-  const votingCloses = rawClosing > Date.now() ? rawClosing : computedClose;
-  const mayorEffectTs = votingCloses; // election end = mayor takes effect immediately
+  // Election timing — use raw API closing directly (no arithmetic)
+  const electionClosing = raw.current?.closing || 0;
+
+  // Candidates with their perks
+  const candidates = (raw.current?.candidates||[]).map(c=>({
+    name:c.name, votes:c.votes||0,
+    perks:(c.perks||[]).map(p=>p.name),
+  }));
+
+  // Leading candidate's predicted perks (if elected) → pre-compute market impact
+  const sortedCands = [...candidates].sort((a,b)=>b.votes-a.votes);
+  const leadingCandidate = sortedCands[0]?.name || null;
+  const leadingPerks = sortedCands[0]?.perks || [];
+  const futureItemEffects = {};
+  for (const perk of leadingPerks) {
+    const effect = PERK_MARKET[perk];
+    if (!effect) continue;
+    for (const item of effect.items) {
+      futureItemEffects[item] = (futureItemEffects[item]||1.0) * effect.price;
+    }
+  }
 
   const data = {
-    success: true, ts: Date.now(),
-    currentMayor: mayorName,
-    currentPerks: mayorPerks,
-    ministerName, ministerPerk,
-    votingCloses,
-    mayorEffectTs,   // when new mayor ACTUALLY takes effect (shown in-game)
-    nextMayorTs: mayorEffectTs,  // alias used by prediction engine
-    affectedItems,     // { ITEM_ID: priceMultiplier }
-    candidates: (raw.current?.candidates || []).map(c => ({
-      name: c.name, votes: c.votes||0,
-      perks: (c.perks||[]).map(p=>p.name)
-    })),
+    success:true, ts:Date.now(),
+    currentMayor:mayorName, currentPerks:mayorPerks,
+    ministerName, ministerPerk, activePerks,
+    itemEffects,     // current effects
+    perkReasons,     // why each item is affected
+    electionClosing, // exact ts when election ends = new mayor takes effect
+    candidates, leadingCandidate, leadingPerks,
+    futureItemEffects, // predicted effects if leading candidate wins
   };
-  if (env.FLIPPER_CACHE) await env.FLIPPER_CACHE.put(MAYOR_KEY, JSON.stringify(data), { expirationTtl:120 });
+  if (env.FLIPPER_CACHE) await env.FLIPPER_CACHE.put(MAYOR_KEY,JSON.stringify(data),{expirationTtl:60});
   return data;
 }
 
-// ── lastUpdated ────────────────────────────────────────────────────────────────
+// ── lastUpdated ───────────────────────────────────────────────────────────────
 async function serveLastUpdated(env) {
-  if (env.FLIPPER_CACHE) {
-    const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type:'json' });
-    if (c) return json({ lastUpdated:c.lastUpdated, ts:c.ts });
-  }
-  return json({ lastUpdated:0 });
+  if (env.FLIPPER_CACHE) { const c=await env.FLIPPER_CACHE.get(BZ_KEY,{type:'json'}); if(c) return json({lastUpdated:c.lastUpdated,ts:c.ts}); }
+  return json({lastUpdated:0});
 }
 
 // ── History + analytics ───────────────────────────────────────────────────────
-
 async function handleHistory(tag, period, env, ctx) {
-  const ck  = 'hist4_'+tag+'_'+period;
-  const ttl = period==='hour' ? 120 : period==='day' ? 300 : 3600;
-
+  const ck = 'hist5_'+tag+'_'+period;
+  const ttl = period==='hour'?120 : period==='day'?300 : 3600;
   if (env.FLIPPER_CACHE) {
-    const c = await env.FLIPPER_CACHE.get(ck, { type:'json' });
-    if (c && Date.now()-(c.ts||0) < ttl*1000) return json({ ...c, cached:true });
+    const c=await env.FLIPPER_CACHE.get(ck,{type:'json'});
+    if (c&&Date.now()-(c.ts||0)<ttl*1000) return json({...c,cached:true});
   }
-
   try {
     const base = 'https://sky.coflnet.com/api/bazaar/'+encodeURIComponent(tag);
     let endpoint;
-    if (period === 'hour') {
-      endpoint = base+'/history/hour';
-    } else {
-      const days = period==='day'?2 : period==='week'?7 : period==='month'?30 : period==='month3'?90 : period==='month6'?180 : 30;
-      const end   = new Date();
-      const start = new Date(end.getTime() - days*86400000);
+    if (period==='hour') { endpoint = base+'/history/hour'; }
+    else {
+      const days = period==='day'?2:period==='week'?7:period==='month'?30:period==='month3'?90:period==='month6'?180:30;
+      const end=new Date(), start=new Date(end.getTime()-days*86400000);
       endpoint = base+'/history?start='+start.toISOString()+'&end='+end.toISOString();
     }
-
-    const r = await fetch(endpoint, { headers:{ 'User-Agent':'sb-flipper/1.0', Accept:'application/json' } });
+    const r=await fetch(endpoint,{headers:{'User-Agent':'sb-flipper/1.0',Accept:'application/json'}});
     if (!r.ok) throw new Error('CoflNet '+r.status);
-    const raw = await r.json();
-
-    // Parse points — handle both array formats CoflNet returns
-    const points = (Array.isArray(raw) ? raw : (raw.points || raw.data || []))
-      .map(p => ({
-        t:  new Date(p.timestamp || p.time || p.t).getTime(),
-        b:  r1(p.buy  || p.buyPrice  || p.b || 0),
-        s:  r1(p.sell || p.sellPrice || p.s || 0),
-        bv: p.buyVolume  || p.bv || 0,
-        sv: p.sellVolume || p.sv || 0,
+    const raw=await r.json();
+    const rawArr = Array.isArray(raw)?raw:(raw.points||raw.data||[]);
+    const points = rawArr
+      .map(p=>({
+        t:new Date(p.timestamp||p.time||p.t||0).getTime(),
+        b:r1(p.buy||p.buyPrice||p.b||0),
+        s:r1(p.sell||p.sellPrice||p.s||0),
+        bv:p.buyVolume||p.bv||0, sv:p.sellVolume||p.sv||0,
       }))
-      .filter(p => (p.b > 0 || p.s > 0) && !isNaN(p.t))
-      .sort((a,b) => a.t - b.t);
+      .filter(p=>(p.b>0||p.s>0)&&p.t>0).sort((a,b)=>a.t-b.t);
 
-    // Get mayor data for event-aware prediction
-    let mayorData = null;
+    // Get mayor + Jacob data for analytics
+    let mayorData=null, jacobContests=[];
     if (env.FLIPPER_CACHE) {
-      try { const m = await env.FLIPPER_CACHE.get(MAYOR_KEY, {type:'json'}); if(m) mayorData=m; } catch(e){}
+      try { const m=await env.FLIPPER_CACHE.get(MAYOR_KEY,{type:'json'}); if(m) mayorData=m; } catch(e){}
     }
-
-    // Get upcoming Jacob contests
-    let jacobContests = [];
-    try {
-      const jr = await fetch('https://jacobs.strassburger.dev/api/jacobcontests');
-      if (jr.ok) jacobContests = await jr.json();
-    } catch(e){}
+    try { const jr=await fetch('https://jacobs.strassburger.dev/api/jacobcontests'); if(jr.ok) jacobContests=await jr.json(); } catch(e){}
 
     const analytics = computeAnalytics(points, tag, mayorData, jacobContests);
-    const data = { success:true, ts:Date.now(), tag, period, points, analytics };
-
-    if (env.FLIPPER_CACHE)
-      ctx.waitUntil(env.FLIPPER_CACHE.put(ck, JSON.stringify(data), { expirationTtl:ttl }));
-
+    const data={success:true,ts:Date.now(),tag,period,points,analytics};
+    if (env.FLIPPER_CACHE) ctx.waitUntil(env.FLIPPER_CACHE.put(ck,JSON.stringify(data),{expirationTtl:ttl}));
     return json(data);
   } catch(e) {
-    return json({ success:false, error:e.message, tag, period, points:[], analytics:null });
+    return json({success:false,error:e.message,tag,period,points:[],analytics:null});
   }
 }
 
-// ── Analytics engine ──────────────────────────────────────────────────────────
-
+// ── Analytics ─────────────────────────────────────────────────────────────────
 function computeAnalytics(points, tag, mayorData, jacobContests) {
-  if (!points || points.length < 5) return null;
+  if (!points||points.length<5) return null;
+  const prices = points.map(p=>p.b||p.s).filter(v=>v>0);
+  if (prices.length<5) return null;
+  const n=prices.length;
+  const mean=prices.reduce((a,b)=>a+b,0)/n;
+  const sorted=[...prices].sort((a,b)=>a-b);
+  const min=sorted[0], max=sorted[n-1];
+  const stdDev=Math.sqrt(prices.reduce((s,p)=>s+(p-mean)**2,0)/n);
+  const current=prices[n-1];
+  const zScore=stdDev>0?(current-mean)/stdDev:0;
+  const rsi=computeRSI(prices,Math.min(14,Math.floor(n/4)));
+  const recent10=prices.slice(-Math.min(10,n));
+  const momentum=recent10.length>1?(recent10[recent10.length-1]-recent10[0])/recent10[0]*100:0;
+  const volatility=mean>0?(stdDev/mean)*100:0;
 
-  const prices = points.map(p => p.b || p.s).filter(v => v > 0);
-  const n = prices.length;
-  if (n < 5) return null;
+  // Detect data interval
+  const deltas=[];
+  for(let i=1;i<Math.min(20,points.length);i++) deltas.push(points[i].t-points[i-1].t);
+  const intervalMs=deltas.length?deltas.reduce((a,b)=>a+b,0)/deltas.length:3600000;
+  const pointsPerDay=86400000/Math.max(intervalMs,60000);
 
-  // Basic stats
-  const mean   = prices.reduce((a,b)=>a+b,0)/n;
-  const sorted = [...prices].sort((a,b)=>a-b);
-  const min    = sorted[0], max = sorted[n-1];
-  const stdDev = Math.sqrt(prices.reduce((s,p)=>s+(p-mean)**2,0)/n);
-  const current = prices[n-1];
-  const zScore  = stdDev > 0 ? (current-mean)/stdDev : 0;
+  // Slope from last 30% of data
+  const recentN=Math.max(5,Math.round(n*0.3));
+  const slopePerPoint=linearSlope(prices.slice(-recentN));
+  const slopePerDay=slopePerPoint*pointsPerDay;
 
-  // RSI (14-period)
-  const rsi = computeRSI(prices, Math.min(14, Math.floor(n/4)));
+  // Signal
+  let signal='HOLD', signalStrength=0;
+  if(rsi<35&&zScore<-0.3&&momentum>-5){ signal='BUY'; signalStrength=Math.min(100,Math.round((35-rsi)*2.5+(-zScore)*25+Math.max(0,momentum)*2)); }
+  if(rsi>65&&zScore>0.3&&momentum<5){ signal='SELL'; signalStrength=Math.min(100,Math.round((rsi-65)*2.5+zScore*25)); }
+  if(rsi<20&&zScore<-1){ signal='BUY'; signalStrength=Math.min(100,signalStrength+20); }
+  if(rsi>80&&zScore>1){ signal='SELL'; signalStrength=Math.min(100,signalStrength+20); }
 
-  // Detect real interval between points
-  const deltas = [];
-  for (let i=1; i<Math.min(20,points.length); i++) deltas.push(points[i].t - points[i-1].t);
-  const intervalMs = deltas.length > 0 ? deltas.reduce((a,b)=>a+b,0)/deltas.length : 3600000;
-  const pointsPerDay = 86400000 / Math.max(intervalMs, 60000);
+  const distToMean=mean-current;
+  let holdDays=14;
+  if(Math.abs(slopePerDay)>0.001&&Math.sign(distToMean)===Math.sign(slopePerDay))
+    holdDays=Math.max(1,Math.round(Math.abs(distToMean)/Math.abs(slopePerDay)));
 
-  // Slope using last 48 hourly points (or available)
-  const recentN = Math.min(Math.round(48*pointsPerDay/24), n);
-  const recentPrices = prices.slice(-recentN);
-  const slope = linearSlope(recentPrices); // per data point
-  const slopePerDay = slope * pointsPerDay;
-  const volatility = mean > 0 ? (stdDev/mean)*100 : 0;
-
-  // 10-point momentum
-  const recent10 = prices.slice(-Math.min(10,n));
-  const momentum10 = recent10.length>1 ? (recent10[recent10.length-1]-recent10[0])/recent10[0]*100 : 0;
-
-  // ── Signal ────────────────────────────────────────────────────────────────
-  let signal = 'HOLD', signalStrength = 0;
-  if (rsi < 35 && zScore < -0.3 && momentum10 > -5) {
-    signal = 'BUY';
-    signalStrength = Math.min(100, Math.round((35-rsi)*2.5 + (-zScore)*25 + Math.max(0,momentum10)*2));
-  }
-  if (rsi > 65 && zScore > 0.3 && momentum10 < 5) {
-    signal = 'SELL';
-    signalStrength = Math.min(100, Math.round((rsi-65)*2.5 + zScore*25));
-  }
-  if (rsi < 20 && zScore < -1) { signal='BUY'; signalStrength=Math.min(100,signalStrength+20); }
-  if (rsi > 80 && zScore > 1)  { signal='SELL'; signalStrength=Math.min(100,signalStrength+20); }
-
-  // ── Hold time ─────────────────────────────────────────────────────────────
-  const distToMean = mean - current;
-  let holdDays = 14;
-  if (Math.abs(slopePerDay) > 0.001 && Math.sign(distToMean) === Math.sign(slopePerDay))
-    holdDays = Math.max(1, Math.round(Math.abs(distToMean)/Math.abs(slopePerDay)));
-
-  // ── Event-aware prediction ────────────────────────────────────────────────
-  const now = Date.now();
-  const extrapolation = buildEventAwarePrediction({
-    points, prices, tag, slope, intervalMs, mean, stdDev,
-    mayorData, jacobContests, now, slopePerDay
-  });
+  const extrapolation = buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, intervalMs, mayorData, jacobContests);
 
   return {
-    mean:r1(mean), min:r1(min), max:r1(max), stdDev:r1(stdDev),
-    volatility:r2(volatility), current:r1(current), zScore:r2(zScore),
-    rsi:r1(rsi), slopePerDay:r4(slopePerDay), signal, signalStrength,
-    holdDays, expectedReturn:r2((mean-current)/current*100),
-    priceRange:r2(((max-min)/mean)*100), momentum:r2(momentum10),
-    extrapolation,
-    intervalMs: Math.round(intervalMs),
+    mean:r1(mean),min:r1(min),max:r1(max),stdDev:r1(stdDev),
+    volatility:r2(volatility),current:r1(current),zScore:r2(zScore),
+    rsi:r1(rsi),slopePerDay:r4(slopePerDay),signal,signalStrength,
+    holdDays,expectedReturn:r2((mean-current)/current*100),
+    priceRange:r2(((max-min)/mean)*100),momentum:r2(momentum),
+    extrapolation, intervalMs:Math.round(intervalMs),
   };
 }
 
-// ── Event-aware prediction ──────────────────────────────────────────────────
-// Uses SkyBlock seasonal pattern extraction from 6M history + event overlays
-// NOT a straight line — extracts actual price cycles from the data itself
+// ── Prediction engine ─────────────────────────────────────────────────────────
+// Builds realistic forward prediction using:
+// 1. Extracted SkyBlock seasonal pattern (16 bins across SB year)
+// 2. Fourier-like cycle detection (find dominant period in price data)
+// 3. Event-aware price adjustments (mayor perks + fixed events + Jacob contests)
+// 4. Volatility-scaled noise
+// 5. Momentum decay
 
-function buildEventAwarePrediction({ points, prices, tag, slope, intervalMs, mean, stdDev, mayorData, jacobContests, now, slopePerDay }) {
-  const last = points[points.length - 1];
-  if (!last || prices.length < 10) return [];
+function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, intervalMs, mayorData, jacobContests) {
+  const last=points[points.length-1];
+  if(!last||prices.length<10) return [];
+  // Step at exactly 1 SkyBlock day (20 real minutes) so events fire at correct SB calendar positions
+  // Output every 3rd step (= 1 real hour) to keep payload manageable
+  const stepMs  = SB_DAY_MS;          // 1200000ms = 20 min = 1 SkyBlock day
+  const outputEvery = 3;              // store every 3rd step = 1 real hour resolution
+  const futureDays  = 30;
+  const steps = Math.round(futureDays * 86400000 / stepMs); // 2160 SkyBlock days
 
-  const SB_YEAR_MS2 = 124 * 3600000;
-  const futureDays = 30;
-  const stepMs = Math.max(intervalMs, 3600000);
-  const steps = Math.round(futureDays * 86400000 / stepMs);
-
-  // ── Extract seasonal pattern binned by SkyBlock year phase ──────────────
-  const NUM_BINS = 24;
-  const bins = Array.from({length: NUM_BINS}, () => ({ sum: 0, count: 0 }));
-  for (let i = 0; i < points.length; i++) {
-    const pt = points[i];
-    const price = pt.b || pt.s;
-    if (price <= 0) continue;
-    const sbPhase = ((pt.t - SB_EPOCH) % SB_YEAR_MS2) / SB_YEAR_MS2;
-    const bin = Math.floor(sbPhase * NUM_BINS) % NUM_BINS;
-    bins[bin].sum   += price / mean;
-    bins[bin].count += 1;
+  // ── 1. Seasonal pattern: bin prices by SB year phase (32 bins) ─────────────
+  const NUM_BINS=32;
+  const binData=Array.from({length:NUM_BINS},()=>({vals:[]}));
+  for(const pt of points){
+    const price=pt.b||pt.s; if(price<=0) continue;
+    const phase=((pt.t-SB_EPOCH)%SB_YEAR_MS+SB_YEAR_MS)%SB_YEAR_MS/SB_YEAR_MS;
+    const bin=Math.min(NUM_BINS-1,Math.floor(phase*NUM_BINS));
+    binData[bin].vals.push(price/mean);
   }
-  // Fill empty bins by interpolating neighbours
-  const pattern = bins.map((b, i) => {
-    if (b.count > 0) return b.sum / b.count;
-    for (let d = 1; d < NUM_BINS; d++) {
-      const prev = bins[(i - d + NUM_BINS) % NUM_BINS];
-      const next = bins[(i + d) % NUM_BINS];
-      if (prev.count > 0 && next.count > 0) return (prev.sum/prev.count + next.sum/next.count) / 2;
-      if (prev.count > 0) return prev.sum / prev.count;
-      if (next.count > 0) return next.sum / next.count;
-    }
-    return 1.0;
+  // Compute median per bin (robust to outliers)
+  const pattern=binData.map((b,i)=>{
+    if(b.vals.length===0) return null;
+    const s=[...b.vals].sort((a,c)=>a-c);
+    return s[Math.floor(s.length/2)];
   });
+  // Fill null bins with interpolation
+  for(let i=0;i<NUM_BINS;i++){
+    if(pattern[i]===null){
+      for(let d=1;d<NUM_BINS;d++){
+        const prev=pattern[(i-d+NUM_BINS)%NUM_BINS];
+        const next=pattern[(i+d)%NUM_BINS];
+        if(prev!==null&&next!==null){ pattern[i]=(prev+next)/2; break; }
+        if(prev!==null){ pattern[i]=prev; break; }
+        if(next!==null){ pattern[i]=next; break; }
+      }
+      if(pattern[i]===null) pattern[i]=1.0;
+    }
+  }
 
-  // ── Long-term trend from last 90 days ─────────────────────────────────────
-  const recentN = Math.min(prices.length, Math.round(90 * 86400000 / intervalMs));
-  const longSlope = linearSlope(prices.slice(-recentN));
+  // ── 2. Autocorrelation cycle detection ─────────────────────────────────────
+  // Find dominant cycle length in the price data
+  const maxLag=Math.min(prices.length-1,Math.round(SB_YEAR_MS/stepMs)); // up to 1 SB year
+  let bestCycleLen=0, bestCorr=0;
+  const centred=prices.map(p=>p-mean);
+  for(let lag=Math.max(5,Math.round(maxLag/20));lag<=maxLag;lag+=Math.max(1,Math.round(maxLag/200))){
+    let corr=0;
+    for(let i=lag;i<centred.length;i++) corr+=centred[i]*centred[i-lag];
+    corr/=(centred.length-lag);
+    if(corr>bestCorr){ bestCorr=corr; bestCycleLen=lag; }
+  }
+  // Cycle amplitude: how much the detected cycle contributes
+  const cycleAmp = bestCycleLen>0 ? Math.min(stdDev*0.5, Math.sqrt(bestCorr/prices.length)) : 0;
 
-  // ── Event boost function ──────────────────────────────────────────────────
-  const getEventBoost = (ts) => {
-    let boost = 0;
-    // Jacob contests — crops spike ±2h around contest
-    if (jacobContests) {
-      const CROP_IDS2 = {
-        'Wheat':'WHEAT','Carrot':'CARROT_ITEM','Potato':'POTATO_ITEM',
-        'Sugar Cane':'SUGAR_CANE','Pumpkin':'PUMPKIN','Melon':'MELON',
-        'Cactus':'CACTUS','Cocoa Beans':'COCOA_BEANS','Mushroom':'MUSHROOM_COLLECTION',
-        'Nether Wart':'NETHER_STALK','Sunflower':'SUNFLOWER','Moonflower':'MOONFLOWER',
+  // ── 3. Event boost at a given timestamp ────────────────────────────────────
+  const getEventBoost = (ts, nowTs) => {
+    let boost=1.0;
+    const reasons=[];
+    const sbDay=sbDayOfYear(ts);
+
+    // Fixed annual events
+    for(const evt of FIXED_EVENTS){
+      if(sbDay>=evt.start&&sbDay<=evt.end){
+        const itemMatch = evt.items.some(id=>{
+          const t=tag.toUpperCase();
+          return t===id||t.includes(id.replace('_ITEM','').split('_')[0])||id.split('_')[0]===t.split('_')[0];
+        });
+        if(itemMatch){
+          const mult = evt.spikeAt&&sbDay>=evt.spikeAt ? (evt.spikeMult||evt.mult) : evt.mult;
+          boost*=mult;
+          reasons.push({event:evt.name,mult});
+        }
+      }
+    }
+
+    // Mayor perks — fade after election
+    if(mayorData?.itemEffects?.[tag]){
+      const effect=mayorData.itemEffects[tag];
+      if(mayorData.electionClosing>0&&ts>mayorData.electionClosing){
+        // Mayor changed — revert over 7 days (1 SB year ≈ 5.2 days, so 7 real days is a good taper)
+        const daysAfter=(ts-mayorData.electionClosing)/86400000;
+        const w=Math.max(0,1-daysAfter/7);
+        boost*=(1+(effect-1)*w);
+        if(Math.abs(effect-1)>0.05) reasons.push({event:'Mayor '+mayorData.currentMayor,mult:1+(effect-1)*w});
+      } else if(ts<=mayorData.electionClosing||!mayorData.electionClosing){
+        boost*=effect;
+        const reason=mayorData.perkReasons?.[tag];
+        if(reason) reasons.push({event:'Mayor perk: '+(reason[0]?.perk||''),mult:effect});
+      }
+    }
+
+    // Future mayor prediction (if leading candidate wins)
+    if(mayorData?.futureItemEffects?.[tag]&&mayorData.electionClosing>0&&ts>mayorData.electionClosing){
+      const futEffect=mayorData.futureItemEffects[tag];
+      const daysAfter=(ts-mayorData.electionClosing)/86400000;
+      const w=Math.min(1,daysAfter/3); // ramps in over 3 days
+      boost*=(1+(futEffect-1)*w);
+      if(Math.abs(futEffect-1)>0.05) reasons.push({event:'Future mayor: '+mayorData.leadingCandidate,mult:futEffect});
+    }
+
+    // Jacob contests (from API — actual future contests)
+    if(jacobContests?.length){
+      const CROP_IDS={
+        'Wheat':'WHEAT','Carrot':'CARROT_ITEM','Potato':'POTATO_ITEM','Sugar Cane':'SUGAR_CANE',
+        'Pumpkin':'PUMPKIN','Melon':'MELON','Cactus':'CACTUS','Cocoa Beans':'COCOA_BEANS',
+        'Mushroom':'MUSHROOM_COLLECTION','Nether Wart':'NETHER_STALK','Sunflower':'SUNFLOWER',
+        'Moonflower':'MOONFLOWER','Wild Rose':'WILD_ROSE',
       };
-      for (const ct of jacobContests) {
-        if (ts >= ct.timestamp - 7200000 && ts <= ct.timestamp + 20*60000 + 7200000) {
-          for (const cropName of (ct.cropNames||[])) {
-            const id = CROP_IDS2[cropName];
-            if (id && tag.includes(id.split('_')[0])) boost += 0.25;
+      for(const ct of jacobContests){
+        const window=3600000*3; // 3h window
+        if(ts>=ct.timestamp-window&&ts<=ct.timestamp+window+20*60000){
+          for(const cropName of (ct.cropNames||[])){
+            const id=CROP_IDS[cropName];
+            if(id){
+              const tagU=tag.toUpperCase();
+              if(tagU===id||tagU.startsWith(id.split('_')[0])){
+                boost*=1.30;
+                reasons.push({event:'Jacob: '+cropName,mult:1.30});
+              }
+            }
           }
         }
       }
     }
-    // Mayor effects — fade out after mayor changes
-    if (mayorData?.affectedItems?.[tag]) {
-      const m = mayorData.affectedItems[tag];
-      const daysUntil = mayorData.nextMayorTs > 0 ? (mayorData.nextMayorTs - ts) / 86400000 : 99;
-      const w = daysUntil > 0 ? 1.0 : Math.max(0, 1 + daysUntil / 14);
-      boost += (m - 1.0) * w;
-    }
-    // Annual SkyBlock events
-    const sbYear2 = Math.floor((ts - SB_EPOCH) / SB_YEAR_MS2);
-    const sbYearStart2 = SB_EPOCH + sbYear2 * SB_YEAR_MS2;
-    const sbDay2 = Math.floor((ts - sbYearStart2) / SB_DAY_MS) + 1;
-    for (const evt of ANNUAL_EVENTS) {
-      if (sbDay2 >= evt.sbDayStart && sbDay2 <= evt.sbDayEnd) {
-        if (evt.items.some(id => tag.includes(id.split('_')[0]) || id.includes(tag.split('_')[0]))) {
-          boost += evt.effect - 1.0;
-        }
-      }
-    }
-    return boost;
+
+    return {boost, reasons};
   };
 
-  // ── Project forward: trend + seasonal + events + momentum ────────────────
-  const lastPrices = prices.slice(-5);
-  const momentum0 = lastPrices.length > 1
-    ? (lastPrices[lastPrices.length-1] - lastPrices[0]) / lastPrices.length : 0;
+  // ── 4. Project forward ──────────────────────────────────────────────────────
+  const result=[];
+  const recent5=prices.slice(-5);
+  const momentum0=recent5.length>1?(recent5[recent5.length-1]-recent5[0])/recent5.length:0;
+  const nowTs=last.t;
 
-  const result = [];
-  let trendOffset = 0;
-  let momentum = momentum0;
-  let lastPrice = last.b || last.s || mean;
+  let lastPrice=last.b||last.s||mean;
+  let momentum=momentum0;
+  let trendOffset=0;
+  let cyclePhase=((last.t-SB_EPOCH)%SB_YEAR_MS+SB_YEAR_MS)%SB_YEAR_MS/SB_YEAR_MS; // 0-1
 
-  for (let i = 1; i <= steps; i++) {
-    const ts = last.t + i * stepMs;
-    trendOffset += longSlope;
-    const sbPhase = ((ts - SB_EPOCH) % SB_YEAR_MS2) / SB_YEAR_MS2;
-    const bin = Math.floor(sbPhase * NUM_BINS) % NUM_BINS;
-    const seasonal = pattern[bin];
-    const boost = getEventBoost(ts);
-    const baseMean = mean + trendOffset;
-    const target = baseMean * seasonal * (1 + boost);
-    momentum *= 0.85;
-    const pull = (target - lastPrice) * 0.08;
-    const noise = (Math.random() - 0.5) * stdDev * 0.015;
-    lastPrice = lastPrice + momentum + pull + noise;
-    if (lastPrice > 0) result.push({ t: ts, b: r1(lastPrice), s: r1(lastPrice*0.97), eventMult: r2(seasonal*(1+boost)) });
+  for(let i=1;i<=steps;i++){
+    const ts=last.t+i*stepMs;
+    trendOffset+=slopePerPoint; // long-term trend
+    momentum*=0.995;            // gentle decay per SkyBlock day (20 min step)
+
+    // Seasonal pattern target
+    const phase=((ts-SB_EPOCH)%SB_YEAR_MS+SB_YEAR_MS)%SB_YEAR_MS/SB_YEAR_MS;
+    const bin=Math.min(NUM_BINS-1,Math.floor(phase*NUM_BINS));
+    const seasonal=pattern[bin];
+
+    // Detected cycle contribution
+    const cycleContrib = bestCycleLen>0
+      ? cycleAmp*Math.sin(2*Math.PI*i/bestCycleLen)
+      : 0;
+
+    // Event adjustment
+    const {boost, reasons}=getEventBoost(ts, nowTs);
+
+    // Target = (mean+trend) × seasonal × event_boost + cycle
+    const baseMean=mean+trendOffset;
+    const target=baseMean*seasonal*boost+cycleContrib;
+
+    // Mean reversion pull (stronger when price far from target)
+    const dist=target-lastPrice;
+    const pullStrength=Math.min(0.008, 0.002+Math.abs(dist/mean)*0.01); // per 20-min step
+    const pull=dist*pullStrength;
+
+    // Volatility-scaled noise (proportional to recent vol)
+    const noise=(Math.random()-0.5)*stdDev*0.003; // per 20-min step
+
+    lastPrice=lastPrice+momentum+pull+noise;
+    if(lastPrice>0 && i % outputEvery === 0) {
+      result.push({
+        t:ts, b:r1(lastPrice), s:r1(lastPrice*0.97),
+        eventMult:r2(seasonal*boost),
+        reasons: reasons.length>0 ? reasons.map(r=>r.event).slice(0,2) : undefined,
+      });
+    }
   }
   return result;
 }
 
 // ── Math helpers ──────────────────────────────────────────────────────────────
-
-function computeRSI(prices, period) {
-  if (prices.length < period+1) return 50;
-  let gains=0, losses=0;
-  for (let i=1; i<=period; i++) {
-    const d = prices[i]-prices[i-1];
-    if (d>0) gains+=d; else losses-=d;
+function computeRSI(prices, period){
+  if(prices.length<period+1) return 50;
+  let g=0,l=0;
+  for(let i=1;i<=period;i++){ const d=prices[i]-prices[i-1]; if(d>0)g+=d; else l-=d; }
+  let ag=g/period, al=l/period;
+  for(let i=period+1;i<prices.length;i++){
+    const d=prices[i]-prices[i-1];
+    ag=(ag*(period-1)+Math.max(0,d))/period;
+    al=(al*(period-1)+Math.max(0,-d))/period;
   }
-  let ag = gains/period, al = losses/period;
-  for (let i=period+1; i<prices.length; i++) {
-    const d = prices[i]-prices[i-1];
-    ag = (ag*(period-1)+Math.max(0,d))/period;
-    al = (al*(period-1)+Math.max(0,-d))/period;
-  }
-  return al===0 ? 100 : 100 - 100/(1+ag/al);
+  return al===0?100:100-100/(1+ag/al);
 }
-
-function linearSlope(values) {
-  const n = values.length;
-  if (n<2) return 0;
+function linearSlope(values){
+  const n=values.length; if(n<2) return 0;
   const xm=(n-1)/2, ym=values.reduce((a,b)=>a+b,0)/n;
-  let num=0, den=0;
-  for (let i=0;i<n;i++) { num+=(i-xm)*(values[i]-ym); den+=(i-xm)**2; }
-  return den===0 ? 0 : num/den;
+  let num=0,den=0;
+  for(let i=0;i<n;i++){num+=(i-xm)*(values[i]-ym);den+=(i-xm)**2;}
+  return den===0?0:num/den;
 }
-
 const r1=v=>Math.round(v*10)/10;
 const r2=v=>Math.round(v*100)/100;
 const r4=v=>Math.round(v*10000)/10000;
-
 function json(d,s=200){
   return new Response(JSON.stringify(d),{status:s,headers:{'Content-Type':'application/json',...cors()}});
 }
