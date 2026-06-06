@@ -171,7 +171,12 @@ async function refreshMayor(env) {
   }
 
   // Voting closes = raw.current?.closing, mayor takes effect 1 SB year later
-  const votingCloses = raw.current?.closing || 0;
+  // raw.current.closing is the exact ms timestamp when election ends
+  // Fall back to SB year computation if not present
+  const rawClosing = raw.current?.closing || 0;
+  const sbYearsElapsed = Math.floor((Date.now() - SB_EPOCH) / SB_YEAR_MS);
+  const computedClose = SB_EPOCH + (sbYearsElapsed + 1) * SB_YEAR_MS;
+  const votingCloses = rawClosing > Date.now() ? rawClosing : computedClose;
 
   const data = {
     success: true, ts: Date.now(),
@@ -186,7 +191,7 @@ async function refreshMayor(env) {
       perks: (c.perks||[]).map(p=>p.name)
     })),
   };
-  if (env.FLIPPER_CACHE) await env.FLIPPER_CACHE.put(MAYOR_KEY, JSON.stringify(data), { expirationTtl:300 });
+  if (env.FLIPPER_CACHE) await env.FLIPPER_CACHE.put(MAYOR_KEY, JSON.stringify(data), { expirationTtl:120 });
   return data;
 }
 
@@ -337,103 +342,113 @@ function computeAnalytics(points, tag, mayorData, jacobContests) {
   };
 }
 
-// ── Event-aware prediction ────────────────────────────────────────────────────
+// ── Event-aware prediction ──────────────────────────────────────────────────
+// Uses SkyBlock seasonal pattern extraction from 6M history + event overlays
+// NOT a straight line — extracts actual price cycles from the data itself
 
 function buildEventAwarePrediction({ points, prices, tag, slope, intervalMs, mean, stdDev, mayorData, jacobContests, now, slopePerDay }) {
-  const last = points[points.length-1];
-  if (!last) return [];
+  const last = points[points.length - 1];
+  if (!last || prices.length < 10) return [];
 
-  // Project 30 days into the future at hourly intervals
+  const SB_YEAR_MS2 = 124 * 3600000;
   const futureDays = 30;
-  const steps = Math.round(futureDays * 86400000 / Math.max(intervalMs, 3600000));
   const stepMs = Math.max(intervalMs, 3600000);
+  const steps = Math.round(futureDays * 86400000 / stepMs);
 
-  // Build event multiplier timeline
-  // Returns a multiplier for each future timestep
-  const getEventMultiplier = (ts) => {
-    let mult = 1.0;
-
-    // 1. SkyBlock calendar events (Spooky, Fishing Festival, etc.)
-    const sbYear = Math.floor((ts - SB_EPOCH) / SB_YEAR_MS);
-    const sbYearStart = SB_EPOCH + sbYear * SB_YEAR_MS;
-    const sbDayOfYear = Math.floor((ts - sbYearStart) / SB_DAY_MS) + 1;
-
-    for (const evt of ANNUAL_EVENTS) {
-      if (sbDayOfYear >= evt.sbDayStart && sbDayOfYear <= evt.sbDayEnd) {
-        if (evt.items.some(i => tag.includes(i) || i.includes(tag))) {
-          mult *= evt.effect;
-        }
-      }
+  // ── Extract seasonal pattern binned by SkyBlock year phase ──────────────
+  const NUM_BINS = 24;
+  const bins = Array.from({length: NUM_BINS}, () => ({ sum: 0, count: 0 }));
+  for (let i = 0; i < points.length; i++) {
+    const pt = points[i];
+    const price = pt.b || pt.s;
+    if (price <= 0) continue;
+    const sbPhase = ((pt.t - SB_EPOCH) % SB_YEAR_MS2) / SB_YEAR_MS2;
+    const bin = Math.floor(sbPhase * NUM_BINS) % NUM_BINS;
+    bins[bin].sum   += price / mean;
+    bins[bin].count += 1;
+  }
+  // Fill empty bins by interpolating neighbours
+  const pattern = bins.map((b, i) => {
+    if (b.count > 0) return b.sum / b.count;
+    for (let d = 1; d < NUM_BINS; d++) {
+      const prev = bins[(i - d + NUM_BINS) % NUM_BINS];
+      const next = bins[(i + d) % NUM_BINS];
+      if (prev.count > 0 && next.count > 0) return (prev.sum/prev.count + next.sum/next.count) / 2;
+      if (prev.count > 0) return prev.sum / prev.count;
+      if (next.count > 0) return next.sum / next.count;
     }
+    return 1.0;
+  });
 
-    // 2. Jacob's contests — crop items spike during contests
-    if (jacobContests && jacobContests.length > 0) {
-      const CROP_IDS = {
-        'Wheat':'WHEAT', 'Carrot':'CARROT_ITEM', 'Potato':'POTATO_ITEM',
-        'Sugar Cane':'SUGAR_CANE', 'Pumpkin':'PUMPKIN', 'Melon':'MELON',
-        'Cactus':'CACTUS', 'Cocoa Beans':'COCOA_BEANS', 'Mushroom':'MUSHROOM_COLLECTION',
-        'Nether Wart':'NETHER_STALK', 'Sunflower':'SUNFLOWER', 'Moonflower':'MOONFLOWER',
-        'Wild Rose':'WILD_ROSE',
+  // ── Long-term trend from last 90 days ─────────────────────────────────────
+  const recentN = Math.min(prices.length, Math.round(90 * 86400000 / intervalMs));
+  const longSlope = linearSlope(prices.slice(-recentN));
+
+  // ── Event boost function ──────────────────────────────────────────────────
+  const getEventBoost = (ts) => {
+    let boost = 0;
+    // Jacob contests — crops spike ±2h around contest
+    if (jacobContests) {
+      const CROP_IDS2 = {
+        'Wheat':'WHEAT','Carrot':'CARROT_ITEM','Potato':'POTATO_ITEM',
+        'Sugar Cane':'SUGAR_CANE','Pumpkin':'PUMPKIN','Melon':'MELON',
+        'Cactus':'CACTUS','Cocoa Beans':'COCOA_BEANS','Mushroom':'MUSHROOM_COLLECTION',
+        'Nether Wart':'NETHER_STALK','Sunflower':'SUNFLOWER','Moonflower':'MOONFLOWER',
       };
-      for (const contest of jacobContests) {
-        const cStart = contest.timestamp, cEnd = cStart + 20*60000; // 20 min contest
-        if (ts >= cStart - 3600000 && ts <= cEnd + 3600000) { // 1h before+after
-          for (const cropName of (contest.cropNames || [])) {
-            const cropId = CROP_IDS[cropName];
-            if (cropId && (tag === cropId || tag.includes(cropId))) {
-              mult *= 1.25; // crops spike ~25% around contests
-            }
+      for (const ct of jacobContests) {
+        if (ts >= ct.timestamp - 7200000 && ts <= ct.timestamp + 20*60000 + 7200000) {
+          for (const cropName of (ct.cropNames||[])) {
+            const id = CROP_IDS2[cropName];
+            if (id && tag.includes(id.split('_')[0])) boost += 0.25;
           }
         }
       }
     }
-
-    // 3. Mayor/minister effects
-    if (mayorData && mayorData.affectedItems) {
+    // Mayor effects — fade out after mayor changes
+    if (mayorData?.affectedItems?.[tag]) {
       const m = mayorData.affectedItems[tag];
-      if (m) mult *= m;
-      // Taper effect as we get further from current mayor
-      // Mayor changes at nextMayorTs
-      if (mayorData.nextMayorTs > 0 && ts > mayorData.nextMayorTs) {
-        // After mayor change, revert gradually
-        const daysAfter = (ts - mayorData.nextMayorTs) / 86400000;
-        const revertFactor = Math.max(0, 1 - daysAfter/14); // 2 week revert
-        mult = 1.0 + (mult-1.0)*revertFactor;
+      const daysUntil = mayorData.nextMayorTs > 0 ? (mayorData.nextMayorTs - ts) / 86400000 : 99;
+      const w = daysUntil > 0 ? 1.0 : Math.max(0, 1 + daysUntil / 14);
+      boost += (m - 1.0) * w;
+    }
+    // Annual SkyBlock events
+    const sbYear2 = Math.floor((ts - SB_EPOCH) / SB_YEAR_MS2);
+    const sbYearStart2 = SB_EPOCH + sbYear2 * SB_YEAR_MS2;
+    const sbDay2 = Math.floor((ts - sbYearStart2) / SB_DAY_MS) + 1;
+    for (const evt of ANNUAL_EVENTS) {
+      if (sbDay2 >= evt.sbDayStart && sbDay2 <= evt.sbDayEnd) {
+        if (evt.items.some(id => tag.includes(id.split('_')[0]) || id.includes(tag.split('_')[0]))) {
+          boost += evt.effect - 1.0;
+        }
       }
     }
-
-    return mult;
+    return boost;
   };
 
-  // Mean-reversion model with event multipliers
-  // Price tends toward (mean * eventMult) with reversion speed based on volatility
-  const reversionSpeed = 0.05; // 5% of distance per step
+  // ── Project forward: trend + seasonal + events + momentum ────────────────
+  const lastPrices = prices.slice(-5);
+  const momentum0 = lastPrices.length > 1
+    ? (lastPrices[lastPrices.length-1] - lastPrices[0]) / lastPrices.length : 0;
+
   const result = [];
-  let projPrice = last.b || last.s || mean;
-  let projSell  = last.s || last.b || mean * 0.97;
+  let trendOffset = 0;
+  let momentum = momentum0;
+  let lastPrice = last.b || last.s || mean;
 
   for (let i = 1; i <= steps; i++) {
-    const ts   = last.t + i * stepMs;
-    const mult = getEventMultiplier(ts);
-    const target = mean * mult;
-
-    // Mean reversion + trend component
-    const reversion  = (target - projPrice) * reversionSpeed;
-    const trendComp  = slopePerDay * (stepMs / 86400000);
-    // Add some noise based on volatility (dampened)
-    const noise = (Math.random() - 0.5) * stdDev * 0.02;
-
-    projPrice = projPrice + reversion + trendComp * 0.3 + noise;
-    projSell  = projPrice * 0.97; // sell price ~3% below buy
-
-    if (projPrice > 0) {
-      result.push({
-        t: ts,
-        b: r1(projPrice),
-        s: r1(projSell),
-        eventMult: r2(mult),
-      });
-    }
+    const ts = last.t + i * stepMs;
+    trendOffset += longSlope;
+    const sbPhase = ((ts - SB_EPOCH) % SB_YEAR_MS2) / SB_YEAR_MS2;
+    const bin = Math.floor(sbPhase * NUM_BINS) % NUM_BINS;
+    const seasonal = pattern[bin];
+    const boost = getEventBoost(ts);
+    const baseMean = mean + trendOffset;
+    const target = baseMean * seasonal * (1 + boost);
+    momentum *= 0.85;
+    const pull = (target - lastPrice) * 0.08;
+    const noise = (Math.random() - 0.5) * stdDev * 0.015;
+    lastPrice = lastPrice + momentum + pull + noise;
+    if (lastPrice > 0) result.push({ t: ts, b: r1(lastPrice), s: r1(lastPrice*0.97), eventMult: r2(seasonal*(1+boost)) });
   }
   return result;
 }
