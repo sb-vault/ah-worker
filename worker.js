@@ -1,73 +1,84 @@
-// SB Investment Worker v3
-// Full swing-trading algorithm with events, mayors, multi-factor signals
+// sb-flipper Investment Worker v3
+// Full event-aware prediction engine
 
 const BZ_KEY    = 'bz_invest_v3';
 const MAYOR_KEY = 'mayor_v3';
 const KV_TTL    = 130;
+
+// SkyBlock constants
+const SB_EPOCH   = 1560272700000;
+const SB_YEAR_MS = 124 * 3600000;  // 124 real hours per SB year
+const SB_DAY_MS  = SB_YEAR_MS / 372; // 372 SB days per year
+
+// ── Event schedule (SB days within a year) ───────────────────────────────────
+// SkyBlock year has Early Spring (1) through Late Winter (31) × 12 months
+// Events occur at fixed SB calendar positions each year
+const ANNUAL_EVENTS = [
+  { name:'Spooky Festival',  sbDayStart: 298, sbDayEnd: 301, items:['CANDY','GREEN_CANDY','PURPLE_CANDY','JACK_O_LANTERN','SPOOKY_FRAGMENT'], effect: 1.4 },
+  { name:'Fishing Festival', sbDayStart: 91,  sbDayEnd: 94,  items:['FISH','RAW_FISH','TROPHY_FISH','DOLPHIN_PET'], effect: 1.2 },
+  { name:'Season of Jerry',  sbDayStart: 329, sbDayEnd: 341, items:['JERRY_BOX','BLUE_JERRY','GREEN_JERRY','PURPLE_JERRY','GOLDEN_JERRY'], effect: 1.5 },
+  { name:'New Year',         sbDayStart: 359, sbDayEnd: 361, items:['NEW_YEAR_CAKE','CAKE_BAG'], effect: 1.3 },
+  { name:'Mining Fiesta',    sbDayStart: 147, sbDayEnd: 150, items:['MITHRIL','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','EMERALD'], effect: 0.85 },
+];
+
+// ── Mayor/minister perks → market effects ────────────────────────────────────
+const PERK_EFFECTS = {
+  // Farming perks → crop supply UP → prices DOWN
+  'GOATed':           { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','PUMPKIN','SUGAR_CANE','MELON','MUSHROOM_COLLECTION','CACTUS','COCOA_BEANS','NETHER_STALK'], effect: 0.88 },
+  'Blooming Business':{ items:['WHEAT','POTATO_ITEM','CARROT_ITEM','SUGAR_CANE','PUMPKIN','MELON'], effect: 0.90 },
+  'Pelt-pocalypse':   { items:['FUR','PELT'], effect: 0.85 },
+  'Pest Eradicator':  { items:['ENCHANTED_COOKIE','COMPOSTER_UPGRADE','PESTICIDE'], effect: 0.90 },
+  // Mining perks → ore supply UP → prices DOWN
+  'Prospection':      { items:['MITHRIL','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','EMERALD','GEMSTONE_POWDER'], effect: 0.85 },
+  'Mining Fiesta':    { items:['MITHRIL','COBBLESTONE','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND'], effect: 0.80 },
+  'Molten Forge':     { items:['ENCHANTED_IRON','ENCHANTED_GOLD','ENCHANTED_DIAMOND','HARD_STONE'], effect: 0.87 },
+  // Fishing perks → fish/sea supply UP → prices DOWN
+  'Fishing Festival': { items:['RAW_FISH','PRISMARINE_SHARD','SHARK_FIN','SQUUID_HAT','SPONGE','FISHING_EXPERIENCE_BOTTLE'], effect: 0.85 },
+  'Luck of the Sea 2.0':{ items:['RAW_FISH','TROPHY_FISH','DOLPHIN_PET'], effect: 0.88 },
+  // Slayer perks → slayer mats UP → prices DOWN
+  'SLASHED Pricing':  { items:['CORRUPTED_FRAGMENT','WITHER_ESSENCE','SPIDER_CATALYST','REVENANT_FLESH','SADAN_BROOCH'], effect: 0.88 },
+  'Pathfinder':       { items:['REVENANT_FLESH','TARANTULA_SILK','VOIDLING_NUCLEUS','WOLF_TOOTH'], effect: 0.90 },
+  // Special mayor effects
+  'Mythological Ritual':{ items:['GRIFFIN_FEATHER','MINOS_RELIC','CHIMERA','FLAWED_DIAMOND_GEM','MAGICAL_MUSHROOM_SOUP'], effect: 1.35 },
+  'Darker Auctions':  { items:['SCYTHE_BLADE','WITHER_BLOOD','SHADOW_ASSASSIN_CLOAK','SHADOW_FURY'], effect: 1.25 },
+  'Shopping Spree':   { items:['BOOSTER_COOKIE','DUNGEON_ORBS','BEACON'], effect: 1.15 },
+  'Volume Trading':   { items:['BOOSTER_COOKIE','DARK_CACAO_TRUFFLE'], effect: 1.20 },
+  'Extra Event':      { items:['CANDY','GREEN_CANDY','PURPLE_CANDY','FISHING_EXPERIENCE_BOTTLE','MITHRIL'], effect: 1.15 },
+  // Derpy (special) — doubles XP → doubles demand for XP items
+  'Turbo-Minions I':  { items:['ENCHANTED_EGG','SUPER_EGG','OAK_LOG'], effect: 1.3 },
+};
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors() });
 
-    if (url.pathname === '/bazaar') {
-      if (env.FLIPPER_CACHE) {
-        const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
-        if (c) return json({ ...c, cached: true });
-      }
-      ctx.waitUntil(refreshBazaar(env));
-      return json({ success: true, loading: true, products: [], lastUpdated: 0, ts: Date.now() });
-    }
-
+    if (url.pathname === '/bazaar')      return serveBazaar(env, ctx);
+    if (url.pathname === '/mayor')       return serveMayor(env, ctx);
+    if (url.pathname === '/lastUpdated') return serveLastUpdated(env);
     if (url.pathname.startsWith('/history/')) {
       const tag    = decodeURIComponent(url.pathname.slice(9));
       const period = url.searchParams.get('period') || 'month';
       return handleHistory(tag, period, env, ctx);
     }
-
-    if (url.pathname === '/mayor') {
-      if (env.FLIPPER_CACHE) {
-        const c = await env.FLIPPER_CACHE.get(MAYOR_KEY, { type: 'json' });
-        if (c && Date.now() - (c.ts || 0) < 300000) return json({ ...c, cached: true });
-      }
-      return handleMayor(env, ctx);
-    }
-
-    if (url.pathname === '/events') {
-      const events = getUpcomingEvents(Date.now());
-      return json({ success: true, ts: Date.now(), events });
-    }
-
-    if (url.pathname === '/lastUpdated') {
-      if (env.FLIPPER_CACHE) {
-        const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
-        if (c) return json({ lastUpdated: c.lastUpdated, ts: c.ts });
-      }
-      return json({ lastUpdated: 0 });
-    }
-
     if (url.pathname === '/refresh') {
-      if (!env.FLIPPER_CACHE) return json({ success: false, error: 'KV not bound' });
+      if (!env.FLIPPER_CACHE) return json({ success:false, error:'KV not bound' });
       try {
         await Promise.all([refreshBazaar(env), refreshMayor(env)]);
-        const bz = await env.FLIPPER_CACHE.get(BZ_KEY, { type: 'json' });
-        return json({ success: true, products: bz ? bz.count : 0 });
-      } catch (e) { return json({ success: false, error: e.message }); }
+        return json({ success:true, message:'Refreshed' });
+      } catch(e) { return json({ success:false, error:e.message }); }
     }
-
     if (url.pathname === '/debug') {
       const hasKV = !!env.FLIPPER_CACHE;
-      let bzInfo = 'not bound', mayInfo = 'not bound';
+      let bz='N/A', m='N/A';
       if (hasKV) {
-        try { const v = await env.FLIPPER_CACHE.get(BZ_KEY); bzInfo = v ? v.length + ' chars' : 'EMPTY'; } catch(e) { bzInfo = e.message; }
-        try { const v = await env.FLIPPER_CACHE.get(MAYOR_KEY); mayInfo = v ? v.length + ' chars' : 'EMPTY'; } catch(e) { mayInfo = e.message; }
+        try { const v=await env.FLIPPER_CACHE.get(BZ_KEY); bz=v?`${v.length} chars`:'EMPTY'; } catch(e){bz=e.message;}
+        try { const v=await env.FLIPPER_CACHE.get(MAYOR_KEY); m=v?`${v.length} chars`:'EMPTY'; } catch(e){m=e.message;}
       }
-      return json({ kvBound: hasKV, bazaarCache: bzInfo, mayorCache: mayInfo });
+      return json({ kvBound:hasKV, bazaarCache:bz, mayorCache:m });
     }
-
-    return json({ error: 'Not found', routes: ['/bazaar','/history/{tag}','/mayor','/lastUpdated','/refresh','/debug'] }, 404);
+    return json({ error:'Not found', routes:['/bazaar','/history/{tag}?period=hour|day|week|month|month3|month6','/mayor','/lastUpdated','/refresh','/debug'] }, 404);
   },
-
   async scheduled(event, env, ctx) {
     ctx.waitUntil(Promise.all([refreshBazaar(env), refreshMayor(env)]));
   },
@@ -75,596 +86,392 @@ export default {
 
 // ── Bazaar snapshot ───────────────────────────────────────────────────────────
 
+async function serveBazaar(env, ctx) {
+  if (env.FLIPPER_CACHE) {
+    const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type:'json' });
+    if (c) return json({ ...c, cached:true });
+  }
+  ctx.waitUntil(refreshBazaar(env));
+  return json({ success:true, loading:true, products:[], lastUpdated:0, ts:Date.now() });
+}
+
 async function refreshBazaar(env) {
   try {
-    const r = await fetch('https://api.hypixel.net/v2/skyblock/bazaar', { headers: { 'User-Agent': 'sb-flipper/1.0' } });
-    if (!r.ok) throw new Error('Hypixel ' + r.status);
+    const r = await fetch('https://api.hypixel.net/v2/skyblock/bazaar', { headers:{ 'User-Agent':'sb-flipper/1.0' } });
+    if (!r.ok) throw new Error('Hypixel '+r.status);
     const raw = await r.json();
-    const products = [];
 
+    const products = [];
     for (const [id, p] of Object.entries(raw.products || {})) {
       const qs = p.quick_status;
       if (!qs || qs.buyPrice <= 0) continue;
       const buyP = qs.buyPrice, sellP = qs.sellPrice;
       const buyW = qs.buyMovingWeek || 0, sellW = qs.sellMovingWeek || 0;
-      const spread = sellP > 0 ? sellP - buyP : 0;
-      const spreadPct = buyP > 0 ? (spread / buyP) * 100 : 0;
-      const buySummary  = (p.buy_summary  || []).slice(0, 8).map(o => ({ a: Math.round(o.amount), p: r1(o.pricePerUnit), n: o.orders }));
-      const sellSummary = (p.sell_summary || []).slice(0, 8).map(o => ({ a: Math.round(o.amount), p: r1(o.pricePerUnit), n: o.orders }));
-      const topBuy  = buySummary[0]?.p  || 0;
-      const topSell = sellSummary[0]?.p || 0;
-      const buyDepth  = buySummary.reduce( (s, o) => s + o.a, 0);
-      const sellDepth = sellSummary.reduce((s, o) => s + o.a, 0);
-      const momentum = Math.log((Math.max(buyW,1)) / (Math.max(sellW,1))) / Math.log(2);
-      const weeklyCoins = Math.min(buyW, sellW) * ((buyP + sellP) / 2);
-
+      const buySummary  = (p.buy_summary  || []).slice(0,8).map(o=>({ a:Math.round(o.amount), p:r1(o.pricePerUnit), n:o.orders }));
+      const sellSummary = (p.sell_summary || []).slice(0,8).map(o=>({ a:Math.round(o.amount), p:r1(o.pricePerUnit), n:o.orders }));
+      const topBuy = buySummary[0]?.p || 0, topSell = sellSummary[0]?.p || 0;
+      const spread = topSell > 0 && topBuy > 0 ? topSell - topBuy : 0;
+      const spreadPct = topBuy > 0 ? (spread/topBuy)*100 : 0;
+      const weeklyCoins = Math.min(buyW,sellW)*((buyP+sellP)/2);
       products.push({
-        id, buyP: r1(buyP), sellP: r1(sellP), topBuy: r1(topBuy), topSell: r1(topSell),
-        spread: r1(spread), spreadPct: r2(spreadPct),
-        buyW, sellW, sellVol: qs.sellVolume||0, buyVol: qs.buyVolume||0,
-        sellOrders: qs.sellOrders||0, buyOrders: qs.buyOrders||0,
-        weeklyCoins: Math.round(weeklyCoins), buyDepth, sellDepth,
-        momentum: r2(momentum), buySummary, sellSummary,
+        id,
+        buyP:r1(buyP), sellP:r1(sellP), topBuy:r1(topBuy), topSell:r1(topSell),
+        spread:r1(spread), spreadPct:r2(spreadPct),
+        buyW, sellW,
+        sellVol:qs.sellVolume||0, buyVol:qs.buyVolume||0,
+        sellOrders:qs.sellOrders||0, buyOrders:qs.buyOrders||0,
+        weeklyCoins:Math.round(weeklyCoins),
+        buyDepth:  buySummary.reduce((s,o)=>s+o.a,0),
+        sellDepth: sellSummary.reduce((s,o)=>s+o.a,0),
+        momentum: r2(Math.log(Math.max(buyW,1)/Math.max(sellW,1))/Math.log(2)),
+        buySummary, sellSummary,
       });
     }
-
-    const data = { success: true, ts: Date.now(), lastUpdated: raw.lastUpdated, count: products.length, products };
-    await env.FLIPPER_CACHE.put(BZ_KEY, JSON.stringify(data), { expirationTtl: KV_TTL });
-    console.log('Bazaar: ' + products.length + ' products');
-  } catch (e) { console.error('Bazaar:', e.message); }
+    const data = { success:true, ts:Date.now(), lastUpdated:raw.lastUpdated, count:products.length, products };
+    await env.FLIPPER_CACHE.put(BZ_KEY, JSON.stringify(data), { expirationTtl:KV_TTL });
+    console.log('Bazaar: '+products.length);
+  } catch(e) { console.error('Bazaar:',e.message); }
 }
 
-// ── Price history with full algorithm ────────────────────────────────────────
+// ── Mayor ─────────────────────────────────────────────────────────────────────
+
+async function serveMayor(env, ctx) {
+  if (env.FLIPPER_CACHE) {
+    const c = await env.FLIPPER_CACHE.get(MAYOR_KEY, { type:'json' });
+    if (c && Date.now()-(c.ts||0) < 300000) return json({ ...c, cached:true });
+  }
+  try {
+    const data = await refreshMayor(env);
+    return json(data);
+  } catch(e) { return json({ success:false, error:e.message }); }
+}
+
+async function refreshMayor(env) {
+  const r = await fetch('https://api.hypixel.net/resources/skyblock/election', { headers:{'User-Agent':'sb-flipper/1.0'} });
+  if (!r.ok) throw new Error('election '+r.status);
+  const raw = await r.json();
+
+  const mayorName    = raw.mayor?.name || 'Unknown';
+  const mayorPerks   = (raw.mayor?.perks || []).map(p => p.name);
+  const ministerName = raw.mayor?.minister?.candidate?.name || null;
+  const ministerPerk = raw.mayor?.minister?.perk?.name || null;
+
+  // Build affected items from mayor + minister perks
+  const allPerks = [...mayorPerks];
+  if (ministerPerk) allPerks.push(ministerPerk);
+
+  const affectedItems = {};
+  for (const perk of allPerks) {
+    const effect = PERK_EFFECTS[perk];
+    if (effect) {
+      for (const item of effect.items) {
+        affectedItems[item] = (affectedItems[item] || 1) * effect.effect;
+      }
+    }
+  }
+
+  // Voting closes = raw.current?.closing, mayor takes effect 1 SB year later
+  const votingCloses = raw.current?.closing || 0;
+
+  const data = {
+    success: true, ts: Date.now(),
+    currentMayor: mayorName,
+    currentPerks: mayorPerks,
+    ministerName, ministerPerk,
+    votingCloses,
+    nextMayorTs: votingCloses > 0 ? votingCloses + SB_YEAR_MS : 0,
+    affectedItems,     // { ITEM_ID: priceMultiplier }
+    candidates: (raw.current?.candidates || []).map(c => ({
+      name: c.name, votes: c.votes||0,
+      perks: (c.perks||[]).map(p=>p.name)
+    })),
+  };
+  if (env.FLIPPER_CACHE) await env.FLIPPER_CACHE.put(MAYOR_KEY, JSON.stringify(data), { expirationTtl:300 });
+  return data;
+}
+
+// ── lastUpdated ────────────────────────────────────────────────────────────────
+async function serveLastUpdated(env) {
+  if (env.FLIPPER_CACHE) {
+    const c = await env.FLIPPER_CACHE.get(BZ_KEY, { type:'json' });
+    if (c) return json({ lastUpdated:c.lastUpdated, ts:c.ts });
+  }
+  return json({ lastUpdated:0 });
+}
+
+// ── History + analytics ───────────────────────────────────────────────────────
 
 async function handleHistory(tag, period, env, ctx) {
-  const ck  = 'hist3_' + tag + '_' + period;
-  const ttl = period === 'hour' ? 120 : period === 'day' ? 300 : 3600;
+  const ck  = 'hist4_'+tag+'_'+period;
+  const ttl = period==='hour' ? 120 : period==='day' ? 300 : 3600;
 
   if (env.FLIPPER_CACHE) {
-    const c = await env.FLIPPER_CACHE.get(ck, { type: 'json' });
-    if (c && Date.now() - (c.ts || 0) < ttl * 1000) return json({ ...c, cached: true });
+    const c = await env.FLIPPER_CACHE.get(ck, { type:'json' });
+    if (c && Date.now()-(c.ts||0) < ttl*1000) return json({ ...c, cached:true });
   }
 
   try {
-    const base = 'https://sky.coflnet.com/api/bazaar/' + encodeURIComponent(tag);
+    const base = 'https://sky.coflnet.com/api/bazaar/'+encodeURIComponent(tag);
     let endpoint;
     if (period === 'hour') {
-      endpoint = base + '/history/hour';
+      endpoint = base+'/history/hour';
     } else {
-      // All periods use date-range for hourly data
-      const days = period === 'day' ? 2 : period === 'week' ? 7 : period === 'month' ? 30
-                 : period === 'month3' ? 90 : period === 'month6' ? 180 : 30;
+      const days = period==='day'?2 : period==='week'?7 : period==='month'?30 : period==='month3'?90 : period==='month6'?180 : 30;
       const end   = new Date();
-      const start = new Date(end.getTime() - days * 86400000);
-      endpoint = base + '/history?start=' + start.toISOString() + '&end=' + end.toISOString();
+      const start = new Date(end.getTime() - days*86400000);
+      endpoint = base+'/history?start='+start.toISOString()+'&end='+end.toISOString();
     }
 
-    const r = await fetch(endpoint, { headers: { 'User-Agent': 'sb-flipper/1.0', Accept: 'application/json' } });
-    if (!r.ok) throw new Error('CoflNet ' + r.status);
+    const r = await fetch(endpoint, { headers:{ 'User-Agent':'sb-flipper/1.0', Accept:'application/json' } });
+    if (!r.ok) throw new Error('CoflNet '+r.status);
     const raw = await r.json();
 
-    const points = raw.map(p => ({
-      t:  new Date(p.timestamp).getTime(),
-      b:  r1(p.buy  || p.buyPrice  || 0),
-      s:  r1(p.sell || p.sellPrice || 0),
-      bv: p.buyVolume  || 0,
-      sv: p.sellVolume || 0,
-    })).filter(p => p.b > 0 || p.s > 0).sort((a, b) => a.t - b.t);
+    // Parse points — handle both array formats CoflNet returns
+    const points = (Array.isArray(raw) ? raw : (raw.points || raw.data || []))
+      .map(p => ({
+        t:  new Date(p.timestamp || p.time || p.t).getTime(),
+        b:  r1(p.buy  || p.buyPrice  || p.b || 0),
+        s:  r1(p.sell || p.sellPrice || p.s || 0),
+        bv: p.buyVolume  || p.bv || 0,
+        sv: p.sellVolume || p.sv || 0,
+      }))
+      .filter(p => (p.b > 0 || p.s > 0) && !isNaN(p.t))
+      .sort((a,b) => a.t - b.t);
 
-    // Fetch mayor data to enrich analytics
+    // Get mayor data for event-aware prediction
     let mayorData = null;
     if (env.FLIPPER_CACHE) {
-      const mc = await env.FLIPPER_CACHE.get(MAYOR_KEY, { type: 'json' });
-      if (mc) mayorData = mc;
+      try { const m = await env.FLIPPER_CACHE.get(MAYOR_KEY, {type:'json'}); if(m) mayorData=m; } catch(e){}
     }
 
-    const analytics = computeAnalytics(points, mayorData, tag);
-    const data = { success: true, ts: Date.now(), tag, period, points, analytics };
+    // Get upcoming Jacob contests
+    let jacobContests = [];
+    try {
+      const jr = await fetch('https://jacobs.strassburger.dev/api/jacobcontests');
+      if (jr.ok) jacobContests = await jr.json();
+    } catch(e){}
+
+    const analytics = computeAnalytics(points, tag, mayorData, jacobContests);
+    const data = { success:true, ts:Date.now(), tag, period, points, analytics };
 
     if (env.FLIPPER_CACHE)
-      ctx.waitUntil(env.FLIPPER_CACHE.put(ck, JSON.stringify(data), { expirationTtl: ttl }));
+      ctx.waitUntil(env.FLIPPER_CACHE.put(ck, JSON.stringify(data), { expirationTtl:ttl }));
 
     return json(data);
-  } catch (e) {
-    return json({ success: false, error: e.message, tag, period, points: [], analytics: null });
+  } catch(e) {
+    return json({ success:false, error:e.message, tag, period, points:[], analytics:null });
   }
 }
 
-// ── Multi-factor trading algorithm ───────────────────────────────────────────
-// This is a real swing-trading algorithm designed for the SkyBlock economy.
-// Factors considered:
-//  1. RSI (momentum oscillator) — identifies overbought/oversold conditions
-//  2. Z-score — measures deviation from historical mean (mean reversion signal)
-//  3. Bollinger Bands — statistical price channels (breakout detection)
-//  4. MACD — Moving Average Convergence/Divergence (trend + momentum)
-//  5. Volume momentum — buy:sell volume ratio trend
-//  6. Mayor cycle — which items benefit from current/upcoming mayor
-//  7. SkyBlock events — seasonal price patterns (Jacob, Spooky, Year of X)
-//  8. Price velocity — rate of change in recent hours
-//  9. Support/resistance — recent highs/lows as price targets
-// 10. Volatility regime — adjusts signal thresholds for high-volatility items
+// ── Analytics engine ──────────────────────────────────────────────────────────
 
-function computeAnalytics(points, mayorData, itemId) {
-  if (points.length < 5) return null;
+function computeAnalytics(points, tag, mayorData, jacobContests) {
+  if (!points || points.length < 5) return null;
 
-  const buyPrices  = points.map(p => p.b).filter(v => v > 0);
-  const sellPrices = points.map(p => p.s).filter(v => v > 0);
-  const prices = buyPrices.length > 0 ? buyPrices : sellPrices;
-  if (prices.length < 5) return null;
+  const prices = points.map(p => p.b || p.s).filter(v => v > 0);
+  const n = prices.length;
+  if (n < 5) return null;
 
-  const n       = prices.length;
+  // Basic stats
+  const mean   = prices.reduce((a,b)=>a+b,0)/n;
+  const sorted = [...prices].sort((a,b)=>a-b);
+  const min    = sorted[0], max = sorted[n-1];
+  const stdDev = Math.sqrt(prices.reduce((s,p)=>s+(p-mean)**2,0)/n);
   const current = prices[n-1];
-  const mean    = prices.reduce((a,b) => a+b, 0) / n;
-  const sorted  = [...prices].sort((a,b) => a-b);
-  const median  = sorted[Math.floor(n/2)];
-  const min     = sorted[0];
-  const max     = sorted[n-1];
-  const stdDev  = Math.sqrt(prices.reduce((s,p) => s+(p-mean)**2, 0) / n);
-  const zScore  = stdDev > 0 ? (current - mean) / stdDev : 0;
-  const volatility = mean > 0 ? (stdDev / mean) * 100 : 0;
+  const zScore  = stdDev > 0 ? (current-mean)/stdDev : 0;
 
-  // ── 1. RSI ────────────────────────────────────────────────────────────────
-  const rsi = computeRSI(prices, Math.min(14, Math.floor(n/3)));
+  // RSI (14-period)
+  const rsi = computeRSI(prices, Math.min(14, Math.floor(n/4)));
 
-  // ── 2. Bollinger Bands (20-period, 2 std devs) ────────────────────────────
-  const bbPeriod = Math.min(20, n);
-  const bbPrices = prices.slice(-bbPeriod);
-  const bbMean   = bbPrices.reduce((a,b) => a+b, 0) / bbPeriod;
-  const bbStd    = Math.sqrt(bbPrices.reduce((s,p) => s+(p-bbMean)**2, 0) / bbPeriod);
-  const bbUpper  = bbMean + 2 * bbStd;
-  const bbLower  = bbMean - 2 * bbStd;
-  const bbSignal = current < bbLower ? 1 : current > bbUpper ? -1 : 0; // +1=buy, -1=sell
+  // Detect real interval between points
+  const deltas = [];
+  for (let i=1; i<Math.min(20,points.length); i++) deltas.push(points[i].t - points[i-1].t);
+  const intervalMs = deltas.length > 0 ? deltas.reduce((a,b)=>a+b,0)/deltas.length : 3600000;
+  const pointsPerDay = 86400000 / Math.max(intervalMs, 60000);
 
-  // ── 3. MACD (12/26/9 EMA) ────────────────────────────────────────────────
-  const ema12  = computeEMA(prices, 12);
-  const ema26  = computeEMA(prices, 26);
-  const macd   = ema12 - ema26;
-  // Approximate signal line as EMA of recent MACD values
-  const macdSignalVal = macd > 0 ? 1 : -1; // simplified: positive MACD = bullish
+  // Slope using last 48 hourly points (or available)
+  const recentN = Math.min(Math.round(48*pointsPerDay/24), n);
+  const recentPrices = prices.slice(-recentN);
+  const slope = linearSlope(recentPrices); // per data point
+  const slopePerDay = slope * pointsPerDay;
+  const volatility = mean > 0 ? (stdDev/mean)*100 : 0;
 
-  // ── 4. Price velocity (rate of change last 24h vs prior 24h) ─────────────
-  const p24ago = prices[Math.max(0, n-25)];
-  const p48ago = prices[Math.max(0, n-49)];
-  const vel24  = p24ago > 0 ? ((current - p24ago) / p24ago) * 100 : 0;
-  const vel48  = p48ago > 0 && p24ago > 0 ? ((p24ago - p48ago) / p48ago) * 100 : 0;
-  const accel  = vel24 - vel48; // positive = accelerating up
+  // 10-point momentum
+  const recent10 = prices.slice(-Math.min(10,n));
+  const momentum10 = recent10.length>1 ? (recent10[recent10.length-1]-recent10[0])/recent10[0]*100 : 0;
 
-  // ── 5. Volume momentum ────────────────────────────────────────────────────
-  const recentBuyVol  = points.slice(-24).reduce((s,p) => s + p.bv, 0);
-  const recentSellVol = points.slice(-24).reduce((s,p) => s + p.sv, 0);
-  const volRatio      = recentSellVol > 0 ? recentBuyVol / recentSellVol : 1;
-  const volSignal     = volRatio > 1.2 ? 1 : volRatio < 0.8 ? -1 : 0; // buy pressure vs sell
-
-  // ── 6. Support/Resistance ─────────────────────────────────────────────────
-  // Recent highs/lows as price targets
-  const recent168 = prices.slice(-Math.min(168, n));
-  const support    = Math.min(...recent168);
-  const resistance = Math.max(...recent168);
-  const pctFromSupport    = support > 0 ? ((current - support) / support) * 100 : 0;
-  const pctFromResistance = resistance > 0 ? ((resistance - current) / resistance) * 100 : 0;
-  const nearSupport    = pctFromSupport < 3;    // within 3% of support = buy zone
-  const nearResistance = pctFromResistance < 3; // within 3% of resistance = sell zone
-
-  // ── 7. Mayor event boost ──────────────────────────────────────────────────
-  let mayorBoost = 0; // -2 to +2
-  let mayorContext = '';
-  if (mayorData) {
-    const affected = mayorData.mayorImpact || [];
-    const isAffected = affected.includes(itemId);
-    if (isAffected) {
-      // Current mayor affects this item positively
-      const timeToElection = (mayorData.nextElectionTs || 0) - Date.now();
-      if (timeToElection > 0 && timeToElection < 24 * 3600000) {
-        // Election imminent — current mayor effect ending soon
-        mayorBoost = -1;
-        mayorContext = 'Mayor election imminent — effect ending';
-      } else {
-        mayorBoost = 1;
-        mayorContext = 'Affected by mayor: ' + mayorData.currentMayor;
-      }
-    }
-    // Check upcoming candidates
-    const candidates = mayorData.candidates || [];
-    for (const cand of candidates) {
-      const candImpact = getMayorImpact(cand.name);
-      if (candImpact.includes(itemId)) {
-        mayorBoost += 0.5; // potential future benefit
-        mayorContext += ' | Candidate ' + cand.name + ' may benefit this item';
-      }
-    }
-  }
-
-  // ── 8. Seasonal SkyBlock events ───────────────────────────────────────────
-  // Known price patterns for SkyBlock events
-  const eventBoost = getEventBoost(itemId, Date.now());
-
-  // ── 9. Composite signal ───────────────────────────────────────────────────
-  // Weighted scoring system: each factor contributes to a score from -100 to +100
-  // Positive = bullish (buy), Negative = bearish (sell)
-
-  let score = 0;
-  let reasons = [];
-
-  // RSI contribution (weight: 25)
-  if (rsi < 30)      { score += 25; reasons.push('RSI oversold (' + rsi.toFixed(0) + ')'); }
-  else if (rsi < 40) { score += 12; reasons.push('RSI mildly oversold'); }
-  else if (rsi > 70) { score -= 25; reasons.push('RSI overbought (' + rsi.toFixed(0) + ')'); }
-  else if (rsi > 60) { score -= 12; reasons.push('RSI mildly overbought'); }
-
-  // Z-score contribution (weight: 20)
-  if (zScore < -1.5)      { score += 20; reasons.push('Very cheap vs history (z=' + r2(zScore) + ')'); }
-  else if (zScore < -0.5) { score += 10; reasons.push('Cheap vs history (z=' + r2(zScore) + ')'); }
-  else if (zScore > 1.5)  { score -= 20; reasons.push('Very expensive vs history (z=' + r2(zScore) + ')'); }
-  else if (zScore > 0.5)  { score -= 10; reasons.push('Expensive vs history'); }
-
-  // Bollinger Bands (weight: 15)
-  if (bbSignal === 1)  { score += 15; reasons.push('Below lower Bollinger Band — oversold'); }
-  if (bbSignal === -1) { score -= 15; reasons.push('Above upper Bollinger Band — overbought'); }
-
-  // MACD (weight: 10)
-  if (macd > 0 && vel24 > 0) { score += 10; reasons.push('MACD bullish + positive momentum'); }
-  if (macd < 0 && vel24 < 0) { score -= 10; reasons.push('MACD bearish + negative momentum'); }
-
-  // Volume momentum (weight: 10)
-  if (volSignal === 1)  { score += 10; reasons.push('High buy volume vs sell'); }
-  if (volSignal === -1) { score -= 10; reasons.push('High sell volume vs buy'); }
-
-  // Support/Resistance (weight: 10)
-  if (nearSupport)    { score += 10; reasons.push('Near support level'); }
-  if (nearResistance) { score -= 10; reasons.push('Near resistance level'); }
-
-  // Mayor boost (weight: 15)
-  score += mayorBoost * 7.5;
-  if (mayorBoost > 0) reasons.push(mayorContext);
-
-  // Event boost (weight: 15)
-  score += eventBoost.score * 7.5;
-  if (eventBoost.reason) reasons.push(eventBoost.reason);
-
-  // Acceleration modifier
-  if (accel > 2 && score > 0) { score *= 1.2; reasons.push('Accelerating upward'); }
-  if (accel < -2 && score < 0) { score *= 1.2; reasons.push('Accelerating downward'); }
-
-  // ── 10. Final signal ──────────────────────────────────────────────────────
-  let signal = 'HOLD';
-  let signalStrength = 0;
-
-  if (score >= 20) {
+  // ── Signal ────────────────────────────────────────────────────────────────
+  let signal = 'HOLD', signalStrength = 0;
+  if (rsi < 35 && zScore < -0.3 && momentum10 > -5) {
     signal = 'BUY';
-    signalStrength = Math.min(100, Math.round(score));
-  } else if (score <= -20) {
+    signalStrength = Math.min(100, Math.round((35-rsi)*2.5 + (-zScore)*25 + Math.max(0,momentum10)*2));
+  }
+  if (rsi > 65 && zScore > 0.3 && momentum10 < 5) {
     signal = 'SELL';
-    signalStrength = Math.min(100, Math.round(-score));
+    signalStrength = Math.min(100, Math.round((rsi-65)*2.5 + zScore*25));
   }
+  if (rsi < 20 && zScore < -1) { signal='BUY'; signalStrength=Math.min(100,signalStrength+20); }
+  if (rsi > 80 && zScore > 1)  { signal='SELL'; signalStrength=Math.min(100,signalStrength+20); }
 
-  // Target price: use resistance as sell target for BUY signals,
-  // support as target for SELL signals. More nuanced than just "mean".
-  const targetBuy  = bbLower;   // good buy zone
-  const targetSell = resistance * 0.97; // conservative sell target (just below resistance)
+  // ── Hold time ─────────────────────────────────────────────────────────────
+  const distToMean = mean - current;
+  let holdDays = 14;
+  if (Math.abs(slopePerDay) > 0.001 && Math.sign(distToMean) === Math.sign(slopePerDay))
+    holdDays = Math.max(1, Math.round(Math.abs(distToMean)/Math.abs(slopePerDay)));
 
-  // Hold time estimate based on velocity
-  let holdHours = 7 * 24;
-  const velocity = Math.abs(vel24) / 100 * current; // coins/hr change
-  if (velocity > 0) {
-    const distToTarget = signal === 'BUY' ? Math.abs(targetSell - current)
-                                           : Math.abs(current - targetBuy);
-    holdHours = Math.max(1, Math.round(distToTarget / Math.max(velocity, 0.001)));
-  }
-  const holdDays = Math.max(1, Math.round(holdHours / 24));
-
-  // Expected return: from current price to sell target
-  const expectedReturn = current > 0 ? r2((targetSell - current) / current * 100) : 0;
-
-  // Interval for extrapolation
-  let intervalMs = 3600000;
-  if (points.length > 1) {
-    const deltas = [];
-    for (let i = 1; i < Math.min(10, points.length); i++) deltas.push(points[i].t - points[i-1].t);
-    intervalMs = deltas.reduce((a,b)=>a+b,0) / deltas.length;
-  }
-
-  // Extrapolation: 30 days forward using multiple models
-  const extrapolation = extrapolateAdvanced(points, 30, intervalMs, itemId);
+  // ── Event-aware prediction ────────────────────────────────────────────────
+  const now = Date.now();
+  const extrapolation = buildEventAwarePrediction({
+    points, prices, tag, slope, intervalMs, mean, stdDev,
+    mayorData, jacobContests, now, slopePerDay
+  });
 
   return {
-    mean: r1(mean), median: r1(median), min: r1(min), max: r1(max),
-    stdDev: r1(stdDev), volatility: r2(volatility),
-    current: r1(current), zScore: r2(zScore),
-    rsi: r1(rsi), macd: r4(macd), bbUpper: r1(bbUpper), bbLower: r1(bbLower),
-    support: r1(support), resistance: r1(resistance),
-    vel24: r2(vel24), volRatio: r2(volRatio),
-    signal, signalStrength: Math.round(signalStrength),
-    score: r2(score), reasons,
-    holdDays, expectedReturn, extrapolation,
-    targetBuy: r1(targetBuy), targetSell: r1(targetSell),
-    priceRange: r2(((max-min)/mean)*100),
-    momentum: r2(vel24),
-    mayorContext, eventReason: eventBoost.reason,
+    mean:r1(mean), min:r1(min), max:r1(max), stdDev:r1(stdDev),
+    volatility:r2(volatility), current:r1(current), zScore:r2(zScore),
+    rsi:r1(rsi), slopePerDay:r4(slopePerDay), signal, signalStrength,
+    holdDays, expectedReturn:r2((mean-current)/current*100),
+    priceRange:r2(((max-min)/mean)*100), momentum:r2(momentum10),
+    extrapolation,
+    intervalMs: Math.round(intervalMs),
   };
 }
 
-// ── SkyBlock event price boost database ──────────────────────────────────────
-// Known items that spike during specific events
-function getEventBoost(itemId, now) {
-  // SkyBlock year is 124 real hours = 446400000 ms
-  const SB_EPOCH   = 1560272700000;
-  const SB_YEAR_MS = 124 * 3600000;
-  const sbElapsed  = now - SB_EPOCH;
-  const sbYear     = Math.floor(sbElapsed / SB_YEAR_MS);
-  const sbProgress = (sbElapsed % SB_YEAR_MS) / SB_YEAR_MS; // 0-1 through the year
+// ── Event-aware prediction ────────────────────────────────────────────────────
 
-  // SkyBlock months: Early Spring=0, Spring=1, Late Spring=2, Early Summer=3...
-  // Each month = 1/24 of a SkyBlock year (approx)
-  const sbMonth = Math.floor(sbProgress * 24); // 0-23
+function buildEventAwarePrediction({ points, prices, tag, slope, intervalMs, mean, stdDev, mayorData, jacobContests, now, slopePerDay }) {
+  const last = points[points.length-1];
+  if (!last) return [];
 
-  const events = {
-    // Jacob's Farming Contests: happen every ~20 min of SB time, reward farming items
-    // Farming items spike slightly every day
-    'WHEAT':            { spooky: 0, jacob: 0.5, travel: 0 },
-    'POTATO_ITEM':      { spooky: 0, jacob: 0.5, travel: 0 },
-    'CARROT_ITEM':      { spooky: 0, jacob: 0.5, travel: 0 },
-    'PUMPKIN':          { spooky: 1.5, jacob: 0.5, travel: 0 }, // Spooky Festival
-    'MUSHROOM_COLLECTION': { spooky: 0, jacob: 0.5, travel: 0 },
-    'CACTUS':           { spooky: 0, jacob: 0.5, travel: 0 },
-    'SUGAR_CANE':       { spooky: 0, jacob: 0.5, travel: 0 },
-    // Spooky Festival (late October SkyBlock = sbMonth 18-20 approximately)
-    'CANDY_CORN':       { spooky: 2.0, jacob: 0, travel: 0 },
-    // Travel scrolls / fishing events
-    'PRISMARINE_CRYSTALS': { spooky: 0, jacob: 0, travel: 0.5 },
-    // Mining events (Lift Off, etc.)
-    'MITHRIL_ORE':      { spooky: 0, jacob: 0, travel: 0, mining: 0.5 },
-    'TITANIUM_ORE':     { spooky: 0, jacob: 0, travel: 0, mining: 0.5 },
-    // Bingo: many items spike at start of Bingo month
-    'ENCHANTED_GOLD':   { bingo: 0.5 },
-    'ENCHANTED_IRON':   { bingo: 0.5 },
-    // Year of the Rabbit etc (annual special)
-    'RABBIT_HAT':       { spooky: 0, annual: 1.0 },
-  };
+  // Project 30 days into the future at hourly intervals
+  const futureDays = 30;
+  const steps = Math.round(futureDays * 86400000 / Math.max(intervalMs, 3600000));
+  const stepMs = Math.max(intervalMs, 3600000);
 
-  const itemEvents = events[itemId];
-  if (!itemEvents) return { score: 0, reason: null };
+  // Build event multiplier timeline
+  // Returns a multiplier for each future timestep
+  const getEventMultiplier = (ts) => {
+    let mult = 1.0;
 
-  let score = 0, reason = null;
+    // 1. SkyBlock calendar events (Spooky, Fishing Festival, etc.)
+    const sbYear = Math.floor((ts - SB_EPOCH) / SB_YEAR_MS);
+    const sbYearStart = SB_EPOCH + sbYear * SB_YEAR_MS;
+    const sbDayOfYear = Math.floor((ts - sbYearStart) / SB_DAY_MS) + 1;
 
-  // Spooky festival: sbMonth 18-20 (Late Fall)
-  if (itemEvents.spooky && sbMonth >= 18 && sbMonth <= 20) {
-    score += itemEvents.spooky;
-    reason = 'Spooky Festival active — ' + itemId + ' in high demand';
-  }
-
-  // Pre-spooky positioning (sbMonth 16-17)
-  if (itemEvents.spooky && sbMonth >= 16 && sbMonth < 18) {
-    score += itemEvents.spooky * 0.5;
-    reason = 'Approaching Spooky Festival — buy before spike';
-  }
-
-  // Jacob's farming: always slight positive for farming items
-  if (itemEvents.jacob) {
-    score += itemEvents.jacob * 0.3;
-    reason = (reason ? reason + ' | ' : '') + 'Jacob\'s Contests active';
-  }
-
-  return { score: r2(score), reason };
-}
-
-// Mayor item impact lookup
-function getMayorImpact(mayor) {
-  const impacts = {
-    'Diana':    ['GRIFFIN_FEATHER','MINOS_RELIC','CHIMERA','FLAWED_DIAMOND_GEM','GRIFFIN_UPGRADE_STONE'],
-    'Scorpius': ['CORRUPTED_FRAGMENT','BRIBE'],
-    'Jerry':    ['JERRY_BOX','BLUE_JERRY','GREEN_JERRY','PURPLE_JERRY','GOLDEN_JERRY'],
-    'Cole':     ['HOT_STUFF','COAL','LAVA_BUCKET','FUEL_BLOCK'],
-    'Paul':     ['OVERLOAD_1','REJUVENATE_1','POWER_SHARD'],
-    'Finnegan': ['WHEAT','POTATO_ITEM','CARROT_ITEM','MUSHROOM_COLLECTION','CACTUS','SUGAR_CANE'],
-    'Derpy':    ['ENCHANTED_EGG','SUPER_EGG','RABBIT_HAT'],
-    'Aatrox':   ['MADDOX_BATPHONE','KUUDRA_TEETH','WITHER_BLOOD'],
-    'Foxy':     ['FESTIVAL_MASK_BEAR','FESTIVAL_MASK_FOX','FESTIVAL_MASK_WOLF'],
-    'Diaz':     ['COINS_OF_GOLD','BUDGET_HOPPER'],
-    'Marina':   ['PRISMARINE_SHARD','PRISMARINE_CRYSTALS','RAW_FISH','SPONGE'],
-  };
-  return impacts[mayor] || [];
-}
-
-// ── Advanced multi-model extrapolation ───────────────────────────────────────
-// Uses 4 models blended together:
-//  1. Linear trend (short + long term)
-//  2. Mean reversion (price pulls toward historical mean)
-//  3. Seasonal/cyclical component (detects repeating patterns in the data)
-//  4. Event-driven impulse (adds price spikes at known event times)
-function extrapolateAdvanced(points, futureDays, intervalMs, itemId) {
-  if (points.length < 10) return [];
-  const prices   = points.map(p => p.b || p.s).filter(v => v > 0);
-  if (prices.length < 10) return [];
-  const last     = points[points.length - 1];
-  const n        = prices.length;
-  const mean     = prices.reduce((a,b) => a+b, 0) / n;
-  const current  = prices[n-1];
-
-  // Model 1: Trend (blend short 48pt and long-term)
-  const shortSlope = linearSlope(prices.slice(-Math.min(48, n)));
-  const longSlope  = linearSlope(prices);
-  const trendSlope = shortSlope * 0.6 + longSlope * 0.4;
-
-  // Model 2: Mean reversion strength (stronger when far from mean)
-  const reversionStrength = 0.015; // 1.5% pull per interval
-  const distFromMean = mean - current;
-
-  // Model 3: Cyclical component — detect dominant cycle length
-  // Use autocorrelation to find if there's a repeating pattern
-  let cyclePeriod = 0, cycleAmplitude = 0;
-  if (n >= 48) {
-    // Check for daily (24h) cycle — common in bazaar (Jacob's every 60 min = 24 times/day irl)
-    const dayPeriod = Math.round(3600000 / Math.max(intervalMs, 1000));
-    if (dayPeriod > 0 && dayPeriod < n) {
-      let correlation = 0;
-      for (let i = dayPeriod; i < Math.min(n, dayPeriod * 3); i++) {
-        correlation += (prices[i] - mean) * (prices[i - dayPeriod] - mean);
-      }
-      const variance = prices.reduce((s,p) => s+(p-mean)**2, 0) / n;
-      const normalizedCorr = variance > 0 ? correlation / ((n - dayPeriod) * variance) : 0;
-      if (Math.abs(normalizedCorr) > 0.3) {
-        cyclePeriod    = dayPeriod;
-        cycleAmplitude = Math.sqrt(variance) * normalizedCorr * 0.5;
+    for (const evt of ANNUAL_EVENTS) {
+      if (sbDayOfYear >= evt.sbDayStart && sbDayOfYear <= evt.sbDayEnd) {
+        if (evt.items.some(i => tag.includes(i) || i.includes(tag))) {
+          mult *= evt.effect;
+        }
       }
     }
-  }
 
-  // Model 4: Event impulses for the future
-  // Pre-calculate event boost multipliers for each future time step
-  const now = last.t;
+    // 2. Jacob's contests — crop items spike during contests
+    if (jacobContests && jacobContests.length > 0) {
+      const CROP_IDS = {
+        'Wheat':'WHEAT', 'Carrot':'CARROT_ITEM', 'Potato':'POTATO_ITEM',
+        'Sugar Cane':'SUGAR_CANE', 'Pumpkin':'PUMPKIN', 'Melon':'MELON',
+        'Cactus':'CACTUS', 'Cocoa Beans':'COCOA_BEANS', 'Mushroom':'MUSHROOM_COLLECTION',
+        'Nether Wart':'NETHER_STALK', 'Sunflower':'SUNFLOWER', 'Moonflower':'MOONFLOWER',
+        'Wild Rose':'WILD_ROSE',
+      };
+      for (const contest of jacobContests) {
+        const cStart = contest.timestamp, cEnd = cStart + 20*60000; // 20 min contest
+        if (ts >= cStart - 3600000 && ts <= cEnd + 3600000) { // 1h before+after
+          for (const cropName of (contest.cropNames || [])) {
+            const cropId = CROP_IDS[cropName];
+            if (cropId && (tag === cropId || tag.includes(cropId))) {
+              mult *= 1.25; // crops spike ~25% around contests
+            }
+          }
+        }
+      }
+    }
 
-  const steps   = Math.round((futureDays * 86400000) / intervalMs);
-  const result  = [];
-  let price     = current;
+    // 3. Mayor/minister effects
+    if (mayorData && mayorData.affectedItems) {
+      const m = mayorData.affectedItems[tag];
+      if (m) mult *= m;
+      // Taper effect as we get further from current mayor
+      // Mayor changes at nextMayorTs
+      if (mayorData.nextMayorTs > 0 && ts > mayorData.nextMayorTs) {
+        // After mayor change, revert gradually
+        const daysAfter = (ts - mayorData.nextMayorTs) / 86400000;
+        const revertFactor = Math.max(0, 1 - daysAfter/14); // 2 week revert
+        mult = 1.0 + (mult-1.0)*revertFactor;
+      }
+    }
+
+    return mult;
+  };
+
+  // Mean-reversion model with event multipliers
+  // Price tends toward (mean * eventMult) with reversion speed based on volatility
+  const reversionSpeed = 0.05; // 5% of distance per step
+  const result = [];
+  let projPrice = last.b || last.s || mean;
+  let projSell  = last.s || last.b || mean * 0.97;
 
   for (let i = 1; i <= steps; i++) {
-    const futureT = now + i * intervalMs;
+    const ts   = last.t + i * stepMs;
+    const mult = getEventMultiplier(ts);
+    const target = mean * mult;
 
-    // Trend component
-    const trend = trendSlope;
+    // Mean reversion + trend component
+    const reversion  = (target - projPrice) * reversionSpeed;
+    const trendComp  = slopePerDay * (stepMs / 86400000);
+    // Add some noise based on volatility (dampened)
+    const noise = (Math.random() - 0.5) * stdDev * 0.02;
 
-    // Mean reversion: exponentially decaying pull toward mean
-    const reversion = distFromMean * reversionStrength * Math.exp(-i * 0.005);
+    projPrice = projPrice + reversion + trendComp * 0.3 + noise;
+    projSell  = projPrice * 0.97; // sell price ~3% below buy
 
-    // Cyclical component
-    const cycle = cyclePeriod > 0
-      ? cycleAmplitude * Math.sin((2 * Math.PI * i) / cyclePeriod)
-      : 0;
-
-    // Event impulse: get boost for items affected by upcoming events
-    let eventImpulse = 0;
-    if (itemId) {
-      const boost = getEventBoost(itemId, futureT);
-      if (boost.score > 0) {
-        // Convert score to price % change impulse
-        eventImpulse = price * boost.score * 0.005; // 0.5% per score point
-      } else if (boost.score < 0) {
-        eventImpulse = price * boost.score * 0.003; // sell-off is gentler
-      }
+    if (projPrice > 0) {
+      result.push({
+        t: ts,
+        b: r1(projPrice),
+        s: r1(projSell),
+        eventMult: r2(mult),
+      });
     }
-
-    // Volatility noise (small random-ish component based on historical std)
-    // Use deterministic pseudo-noise based on position (not truly random, for consistency)
-    const stdDev  = Math.sqrt(prices.reduce((s,p) => s+(p-mean)**2, 0) / n);
-    const noise   = stdDev * 0.05 * Math.sin(i * 2.39996); // golden angle oscillation
-
-    price = price + trend + reversion + cycle + eventImpulse + noise;
-    if (price < 1) price = 1;
-
-    result.push({ t: futureT, b: r1(price) });
   }
   return result;
 }
 
-// ── EMA calculation ───────────────────────────────────────────────────────────
-function computeEMA(prices, period) {
-  if (prices.length < period) return prices[prices.length-1] || 0;
-  const k = 2 / (period + 1);
-  let ema = prices.slice(0, period).reduce((a,b) => a+b, 0) / period;
-  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
-  return ema;
-}
+// ── Math helpers ──────────────────────────────────────────────────────────────
 
-function computeRSI(prices, period = 14) {
-  if (prices.length < period + 1) return 50;
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = prices[i] - prices[i-1];
-    if (diff > 0) gains += diff; else losses -= diff;
+function computeRSI(prices, period) {
+  if (prices.length < period+1) return 50;
+  let gains=0, losses=0;
+  for (let i=1; i<=period; i++) {
+    const d = prices[i]-prices[i-1];
+    if (d>0) gains+=d; else losses-=d;
   }
-  let avgGain = gains / period, avgLoss = losses / period;
-  for (let i = period + 1; i < prices.length; i++) {
-    const diff = prices[i] - prices[i-1];
-    avgGain = (avgGain * (period-1) + Math.max(0, diff))  / period;
-    avgLoss = (avgLoss * (period-1) + Math.max(0,-diff)) / period;
+  let ag = gains/period, al = losses/period;
+  for (let i=period+1; i<prices.length; i++) {
+    const d = prices[i]-prices[i-1];
+    ag = (ag*(period-1)+Math.max(0,d))/period;
+    al = (al*(period-1)+Math.max(0,-d))/period;
   }
-  if (avgLoss === 0) return 100;
-  return 100 - 100 / (1 + avgGain / avgLoss);
+  return al===0 ? 100 : 100 - 100/(1+ag/al);
 }
 
 function linearSlope(values) {
   const n = values.length;
-  if (n < 2) return 0;
-  const xm = (n-1)/2;
-  const ym = values.reduce((a,b)=>a+b,0)/n;
-  let num = 0, den = 0;
-  for (let i = 0; i < n; i++) { num += (i-xm)*(values[i]-ym); den += (i-xm)**2; }
-  return den === 0 ? 0 : num/den;
+  if (n<2) return 0;
+  const xm=(n-1)/2, ym=values.reduce((a,b)=>a+b,0)/n;
+  let num=0, den=0;
+  for (let i=0;i<n;i++) { num+=(i-xm)*(values[i]-ym); den+=(i-xm)**2; }
+  return den===0 ? 0 : num/den;
 }
 
-// ── Mayor / election ──────────────────────────────────────────────────────────
+const r1=v=>Math.round(v*10)/10;
+const r2=v=>Math.round(v*100)/100;
+const r4=v=>Math.round(v*10000)/10000;
 
-async function handleMayor(env, ctx) {
-  try {
-    const data = await refreshMayor(env);
-    return json(data);
-  } catch (e) { return json({ success: false, error: e.message }); }
+function json(d,s=200){
+  return new Response(JSON.stringify(d),{status:s,headers:{'Content-Type':'application/json',...cors()}});
 }
-
-async function refreshMayor(env) {
-  const r = await fetch('https://api.hypixel.net/resources/skyblock/election', {
-    headers: { 'User-Agent': 'sb-flipper/1.0' }
-  });
-  if (!r.ok) throw new Error('Election API ' + r.status);
-  const raw = await r.json();
-
-  // The API returns nextElectionTs = when voting CLOSES
-  // The new mayor takes effect one SB year after voting closes
-  const SB_YEAR_MS     = 124 * 3600000;
-  const votingCloseTs  = raw.current?.closing || computeNextElection();
-  const mayorChangeTs  = votingCloseTs + SB_YEAR_MS; // actual mayor change
-  
-  const currentMayorName = raw.mayor?.name || null;
-  const mayorImpact      = getMayorImpact(currentMayorName);
-
-  // Next mayor candidates and their impacts
-  const candidates = (raw.current?.candidates || []).map(c => ({
-    name: c.name,
-    perks: c.perks?.map(p => p.name) || [],
-    votes: c.votes || 0,
-    impact: getMayorImpact(c.name),
-  }));
-  // Sort by votes to find likely winner
-  candidates.sort((a,b) => b.votes - a.votes);
-
-  const data = {
-    success: true, ts: Date.now(),
-    currentMayor:   currentMayorName,
-    currentPerks:   raw.mayor?.perks?.map(p => p.name) || [],
-    nextElectionTs: votingCloseTs,
-    mayorChangeTs:  mayorChangeTs,
-    candidates,
-    mayorImpact,
-    nextMayorImpact: candidates.length > 0 ? candidates[0].impact : [],
-    nextMayorName:   candidates.length > 0 ? candidates[0].name   : null,
-    // Upcoming SkyBlock events (next 2 SB years)
-    upcomingEvents:  getUpcomingEvents(Date.now(), SB_YEAR_MS * 2),
-    sbTime: getSkyBlockTime(Date.now()),
-  };
-
-  if (env?.FLIPPER_CACHE)
-    await env.FLIPPER_CACHE.put(MAYOR_KEY, JSON.stringify(data), { expirationTtl: 300 });
-  return data;
-}
-
-function computeNextElection() {
-  const SB_EPOCH   = 1560272700000;
-  const SB_YEAR_MS = 124 * 3600000;
-  const now = Date.now();
-  const elapsed = now - SB_EPOCH;
-  const currentYear = Math.floor(elapsed / SB_YEAR_MS);
-  return SB_EPOCH + (currentYear + 1) * SB_YEAR_MS;
-}
-
-// ── Util ──────────────────────────────────────────────────────────────────────
-
-const r1 = v => Math.round(v * 10) / 10;
-const r2 = v => Math.round(v * 100) / 100;
-const r4 = v => Math.round(v * 10000) / 10000;
-
-function json(d, s = 200) {
-  return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json', ...cors() } });
-}
-function cors() {
-  return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+function cors(){
+  return {'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,OPTIONS','Access-Control-Allow-Headers':'Content-Type'};
 }
