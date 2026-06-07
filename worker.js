@@ -409,7 +409,7 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   if (!last || prices.length < 10) return [];
 
   const stepMs     = SB_DAY_MS;  // 20min = 1 SkyBlock day for event precision
-  const outputEvery = 1;          // output every step = 20 min resolution
+  const outputEvery = 3;          // internal 20-min steps, output hourly (3x fewer points)
   const futureDays = 30;
   const steps      = Math.round(futureDays * 86400000 / stepMs);
 
