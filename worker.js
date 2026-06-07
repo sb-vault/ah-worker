@@ -282,10 +282,8 @@ async function handleHistory(tag, period, env, ctx) {
       .filter(p=>(p.b>0||p.s>0)&&p.t>0).sort((a,b)=>a.t-b.t);
 
     // Resample to target resolution:
-    //  1h -> 5min (raw), 1d -> 20min, 1w/1m/3m/6m -> 1h
-    const targetInterval = period==='hour' ? 300000
-                         : period==='day'  ? 1200000   // 20 minutes
-                         : 3600000;                     // 1 hour
+    //  All periods use 20-minute (1 SkyBlock day) resolution for consistency
+    const targetInterval = period==='hour' ? 300000 : 1200000; // hour=5min, rest=20min
     points = resample(points, targetInterval);
 
     // Get mayor + Jacob data for analytics
@@ -388,7 +386,7 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   if (!last || prices.length < 10) return [];
 
   const stepMs     = SB_DAY_MS;  // 20min = 1 SkyBlock day for event precision
-  const outputEvery = 3;          // output every 3rd step = 1 real hour
+  const outputEvery = 1;          // output every step = 20 min resolution
   const futureDays = 30;
   const steps      = Math.round(futureDays * 86400000 / stepMs);
 
