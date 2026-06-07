@@ -366,6 +366,20 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   const futureDays = 30;
   const steps      = Math.round(futureDays * 86400000 / stepMs);
 
+  // ── Separate buy & sell price series ──────────────────────────────────────
+  const buyPrices  = points.map(p => p.b).filter(v => v > 0);
+  const sellPrices = points.map(p => p.s).filter(v => v > 0);
+  const buyMean  = buyPrices.length  ? buyPrices.reduce((a,b)=>a+b,0)/buyPrices.length   : mean;
+  const sellMean = sellPrices.length ? sellPrices.reduce((a,b)=>a+b,0)/sellPrices.length : mean*0.95;
+  // Historical buy/sell ratio — used to keep prediction spread realistic
+  const buySellRatio = buyMean > 0 ? sellMean / buyMean : 0.95;
+  // Spread volatility — how much the spread itself varies
+  const spreadSamples = [];
+  for (const pt of points) if (pt.b > 0 && pt.s > 0) spreadSamples.push(pt.s / pt.b);
+  const spreadMean = spreadSamples.length ? spreadSamples.reduce((a,b)=>a+b,0)/spreadSamples.length : buySellRatio;
+  const spreadStd  = spreadSamples.length > 1
+    ? Math.sqrt(spreadSamples.reduce((s,v)=>s+(v-spreadMean)**2,0)/spreadSamples.length) : 0.01;
+
   // ── Model 1: Dominant cycle from autocorrelation ──────────────────────────
   // Scan lags from 1h to 1 SkyBlock year to find the dominant price cycle
   const maxLagSteps = Math.round(SB_YEAR_MS / stepMs);  // ~372 steps = 1 SB year
@@ -507,57 +521,73 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   const dailyVol = stdDev / Math.sqrt(Math.max(1, 86400000 / intervalMs));
   const stepVol  = dailyVol * Math.sqrt(stepMs / 86400000) * 0.5; // scaled to stepMs
 
-  // ── Project forward ────────────────────────────────────────────────────────
-  let lastPrice  = last.b || last.s || mean;
-  let momentum   = slopePerStep > 0 ? Math.min(slopePerStep * 3, stdDev * 0.02) : Math.max(slopePerStep * 3, -stdDev * 0.02);
-  let noiseCarry = 0; // correlated noise carry
-  let trendOffset = 0;
+  // ── Sell-price trend & cycle (computed independently) ─────────────────────
+  const sellSlope = sellPrices.length > 5
+    ? linearSlope(sellPrices.slice(-Math.min(sellPrices.length, trendN))) * (intervalMs / stepMs)
+    : slopePerStep * buySellRatio;
+
+  // ── Project forward — BUY and SELL tracked as separate series ─────────────
+  let buyPrice   = last.b || mean;
+  let sellPrice  = last.s || (last.b ? last.b * spreadMean : sellMean);
+  let buyMom     = slopePerStep  > 0 ? Math.min(slopePerStep*3,  stdDev*0.02) : Math.max(slopePerStep*3,  -stdDev*0.02);
+  let sellMom    = sellSlope     > 0 ? Math.min(sellSlope*3,     stdDev*0.02) : Math.max(sellSlope*3,     -stdDev*0.02);
+  let buyNoise = 0, sellNoise = 0, spreadNoise = 0;
+  let trendOffset = 0, sellTrendOffset = 0;
   const result = [];
+  const rho = 0.7;
 
   for (let i = 1; i <= steps; i++) {
     const ts = last.t + i * stepMs;
-    trendOffset += slopePerStep;
+    trendOffset     += slopePerStep;
+    sellTrendOffset += sellSlope;
 
-    // Seasonal target (if pattern is meaningful)
-    let seasonalMultiplier = 1.0;
+    // Shared seasonal + event multipliers (events affect both buy and sell)
+    let seasonalMult = 1.0;
     if (usePattern) {
       const phase = ((ts - SB_EPOCH) % SB_YEAR_MS + SB_YEAR_MS) % SB_YEAR_MS / SB_YEAR_MS;
       const bin   = Math.min(NUM_BINS-1, Math.floor(phase * NUM_BINS));
-      seasonalMultiplier = pattern[bin];
+      seasonalMult = pattern[bin];
     }
-
-    // Cyclic component (sine wave at detected cycle frequency)
-    const cyclicComponent = cycleAmp * Math.sin(2 * Math.PI * i / Math.max(1, bestCycleSteps) + cyclePhaseOffset);
-
-    // Event boost
+    const cyclic = cycleAmp * Math.sin(2*Math.PI*i/Math.max(1,bestCycleSteps) + cyclePhaseOffset);
     const { boost, reasons } = getEventInfo(ts);
-    const eventMultiplier = 1.0 + boost;
+    const eventMult = 1.0 + boost;
 
-    // Target = (mean + trend) × seasonal × event + cycle
-    const baseMean = mean + trendOffset;
-    const target   = baseMean * seasonalMultiplier * eventMultiplier + cyclicComponent;
+    // ── BUY price ───────────────────────────────────────────────────────────
+    const buyTarget = (buyMean + trendOffset) * seasonalMult * eventMult + cyclic;
+    const buyDist   = buyTarget - buyPrice;
+    const buyPull   = buyDist * Math.min(0.12, 0.04 + Math.abs(buyDist/Math.max(buyMean,1))*0.15);
+    buyNoise = rho*buyNoise + (1-rho)*(Math.random()-0.5)*2*stepVol;
+    buyMom *= 0.92;
+    buyPrice = buyPrice + buyPull + buyMom + buyNoise;
+    if (buyPrice <= 0) buyPrice = buyMean * 0.5;
 
-    // Mean-reversion pull (proportional to distance)
-    const dist = target - lastPrice;
-    const pullStrength = Math.min(0.12, 0.04 + Math.abs(dist / Math.max(mean, 1)) * 0.15);
-    const pull = dist * pullStrength;
+    // ── SELL price — own trend & cycle, but spread mean-reverts to historical ─
+    // Sell follows its own dynamics but stays in a realistic band vs buy
+    const sellTarget = (sellMean + sellTrendOffset) * seasonalMult * eventMult + cyclic * buySellRatio;
+    const sellDist   = sellTarget - sellPrice;
+    const sellPull   = sellDist * Math.min(0.12, 0.04 + Math.abs(sellDist/Math.max(sellMean,1))*0.15);
+    sellNoise = rho*sellNoise + (1-rho)*(Math.random()-0.5)*2*stepVol*buySellRatio;
+    sellMom *= 0.92;
+    sellPrice = sellPrice + sellPull + sellMom + sellNoise;
 
-    // Correlated noise (AR(1) with rho=0.7)
-    const rho = 0.7;
-    noiseCarry = rho * noiseCarry + (1-rho) * (Math.random()-0.5) * 2 * stepVol;
-
-    // Momentum decay
-    momentum *= 0.92;
-
-    lastPrice = lastPrice + pull + momentum + noiseCarry;
-    if (lastPrice <= 0) lastPrice = mean * 0.5;
+    // Spread sanity: sell should stay below buy by roughly the historical spread
+    // Soft-constrain: pull spread back toward spreadMean if it drifts too far
+    const curSpread = buyPrice > 0 ? sellPrice / buyPrice : spreadMean;
+    spreadNoise = rho*spreadNoise + (1-rho)*(Math.random()-0.5)*2*spreadStd;
+    const targetSpread = spreadMean + spreadNoise;
+    if (Math.abs(curSpread - targetSpread) > spreadStd * 3) {
+      // Spread drifted too far — nudge sell back toward realistic spread
+      sellPrice = buyPrice * (curSpread + (targetSpread - curSpread) * 0.3);
+    }
+    if (sellPrice <= 0) sellPrice = buyPrice * spreadMean;
+    if (sellPrice >= buyPrice) sellPrice = buyPrice * Math.min(0.999, spreadMean); // sell never above buy
 
     if (i % outputEvery === 0) {
       result.push({
         t: ts,
-        b: r1(lastPrice),
-        s: r1(lastPrice * 0.97),
-        eventMult: r2(seasonalMultiplier * eventMultiplier),
+        b: r1(buyPrice),
+        s: r1(sellPrice),
+        eventMult: r2(seasonalMult * eventMult),
         reasons: reasons.length > 0 ? reasons.slice(0, 2) : undefined,
       });
     }
