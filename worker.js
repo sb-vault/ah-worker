@@ -5,7 +5,7 @@ const MAYOR_KEY = 'mayor_v4';
 const KV_TTL    = 130;
 
 // ── SkyBlock calendar constants ───────────────────────────────────────────────
-const SB_EPOCH   = 1560272700000; // June 11 2019 ~17:05 UTC
+const SB_EPOCH   = 1560275700000; // calibrated epoch (election timing accurate)
 const SB_YEAR_MS = 446400000;     // 124 real hours × 3600000
 const SB_DAY_MS  = 1200000;       // 20 real minutes per SkyBlock day
 // SkyBlock months: 12 months × 31 days = 372 days
@@ -265,7 +265,7 @@ async function serveLastUpdated(env) {
 
 // ── History + analytics ───────────────────────────────────────────────────────
 async function handleHistory(tag, period, env, ctx) {
-  const ck = 'hist5_'+tag+'_'+period;
+  const ck = 'hist6_'+tag+'_'+period;
   const ttl = period==='hour'?120 : period==='day'?300 : 3600;
   if (env.FLIPPER_CACHE) {
     const c=await env.FLIPPER_CACHE.get(ck,{type:'json'});
@@ -505,13 +505,11 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
     const reasons = [];
     const sbDay = sbDayOfYear(ts);
 
-    // Fixed annual events
+    // Fixed annual events — exact item ID match only
     for (const evt of FIXED_EVENTS) {
       if (sbDay >= evt.start && sbDay <= evt.end) {
-        const match = evt.items.some(id => {
-          const t = tag.toUpperCase(), idU = id.toUpperCase();
-          return t===idU || t.includes(idU.split('_')[0]) || idU.split('_')[0]===t.split('_')[0];
-        });
+        const tagU = tag.toUpperCase();
+        const match = evt.items.some(id => tagU === id.toUpperCase());
         if (match) {
           const m = evt.spikeAt && sbDay >= evt.spikeAt ? (evt.spikeMult||evt.mult) : evt.mult;
           boost += m - 1.0;
@@ -543,19 +541,40 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
       if (Math.abs(fe-1) > 0.05 && w > 0.1) reasons.push('New mayor: '+mayorData.leadingCandidate);
     }
 
-    // Jacob contests
+    // Jacob's Farming Contests — each contest lasts 20 min and features exactly 3 crops.
+    // The exact bazaar item IDs for each crop name from the API:
     if (jacobContests?.length) {
       const CROP_MAP = {
-        'Wheat':'WHEAT','Carrot':'CARROT_ITEM','Potato':'POTATO_ITEM','Sugar Cane':'SUGAR_CANE',
-        'Pumpkin':'PUMPKIN','Melon':'MELON','Cactus':'CACTUS','Cocoa Beans':'COCOA_BEANS',
-        'Mushroom':'MUSHROOM_COLLECTION','Nether Wart':'NETHER_STALK',
+        'Wheat':'WHEAT',
+        'Carrot':'CARROT_ITEM',
+        'Potato':'POTATO_ITEM',
+        'Sugar Cane':'SUGAR_CANE',
+        'Pumpkin':'PUMPKIN',
+        'Melon':'MELON',
+        'Cactus':'CACTUS',
+        'Cocoa Beans':'COCOA_BEANS',
+        'Mushroom':'MUSHROOM_COLLECTION',
+        'Nether Wart':'NETHER_STALK',
+        'Sunflower':'SUNFLOWER',         // not bazaar but kept for completeness
+        'Moonflower':'MOONFLOWER',
+        'Wild Rose':'WILD_ROSE',
       };
+      const tagU = tag.toUpperCase();
+      const CONTEST_LEN = 1200000;       // 20 minutes
+      const PRE  = 1800000;              // farmers stockpile ~30 min before
+      const POST = 1800000;              // sell-off ~30 min after
       for (const ct of jacobContests) {
-        if (ts >= ct.timestamp - 10800000 && ts <= ct.timestamp + 1200000 + 10800000) {
-          for (const cropName of (ct.cropNames||[])) {
+        const cStart = ct.timestamp, cEnd = ct.timestamp + CONTEST_LEN;
+        if (ts >= cStart - PRE && ts <= cEnd + POST) {
+          for (const cropName of (ct.cropNames || [])) {
             const id = CROP_MAP[cropName];
-            if (id && tag.toUpperCase().includes(id.split('_')[0])) {
-              boost += 0.30; reasons.push('Jacob: '+cropName);
+            // EXACT match only — no loose substring matching
+            if (id && tagU === id) {
+              // During contest: demand spikes (price up). Pre-contest: stockpiling (mild up).
+              const inContest = ts >= cStart && ts <= cEnd;
+              boost += inContest ? 0.25 : 0.12;
+              reasons.push('Jacob: '+cropName);
+              break; // one match is enough per contest
             }
           }
         }
