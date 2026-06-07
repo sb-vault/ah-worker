@@ -316,7 +316,7 @@ async function handleHistory(tag, period, env, ctx) {
     }
     try { const jr=await fetch('https://jacobs.strassburger.dev/api/jacobcontests'); if(jr.ok) jacobContests=await jr.json(); } catch(e){}
 
-    const analytics = computeAnalytics(points, tag, mayorData, jacobContests);
+    const analytics = computeAnalytics(points, tag, mayorData, jacobContests, period);
     const data={success:true,ts:Date.now(),tag,period,points,analytics};
     if (env.FLIPPER_CACHE) ctx.waitUntil(env.FLIPPER_CACHE.put(ck,JSON.stringify(data),{expirationTtl:ttl}));
     return json(data);
@@ -345,7 +345,7 @@ function resample(points, intervalMs) {
 }
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
-function computeAnalytics(points, tag, mayorData, jacobContests) {
+function computeAnalytics(points, tag, mayorData, jacobContests, period) {
   if (!points||points.length<5) return null;
   const prices = points.map(p=>p.b||p.s).filter(v=>v>0);
   if (prices.length<5) return null;
@@ -384,7 +384,7 @@ function computeAnalytics(points, tag, mayorData, jacobContests) {
   if(Math.abs(slopePerDay)>0.001&&Math.sign(distToMean)===Math.sign(slopePerDay))
     holdDays=Math.max(1,Math.round(Math.abs(distToMean)/Math.abs(slopePerDay)));
 
-  const extrapolation = buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, intervalMs, mayorData, jacobContests);
+  const extrapolation = buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, intervalMs, mayorData, jacobContests, period);
 
   return {
     mean:r1(mean),min:r1(min),max:r1(max),stdDev:r1(stdDev),
@@ -404,14 +404,15 @@ function computeAnalytics(points, tag, mayorData, jacobContests) {
 // 4. Event impulse responses (sharp spike then revert)
 // 5. Correlated random walk (volatility-scaled, not white noise)
 
-function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, intervalMs, mayorData, jacobContests) {
+function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, intervalMs, mayorData, jacobContests, period) {
   const last = points[points.length - 1];
   if (!last || prices.length < 10) return [];
 
-  const stepMs     = SB_DAY_MS;  // 20min = 1 SkyBlock day for event precision
-  const outputEvery = 3;          // internal 20-min steps, output hourly (3x fewer points)
-  const futureDays = 30;
-  const steps      = Math.round(futureDays * 86400000 / stepMs);
+  // 1h period predicts at 5-min resolution; all others at 20-min, output hourly
+  const stepMs      = period==='hour' ? 300000 : SB_DAY_MS;
+  const outputEvery = period==='hour' ? 1 : 3;
+  const futureDays  = period==='hour' ? 1 : 30; // 1h period only predicts 1h-ish ahead... use 1 day cap
+  const steps       = Math.round(futureDays * 86400000 / stepMs);
 
   // ── Separate buy & sell price series ──────────────────────────────────────
   const buyPrices  = points.map(p => p.b).filter(v => v > 0);
@@ -596,66 +597,64 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
     : longSlope * buySellRatio;
   const sellSlope = Math.sign(rawSellSlope) * Math.min(Math.abs(rawSellSlope), maxTrendTotal / steps / (intervalMs/stepMs));
 
-  // ── Project forward — BUY and SELL tracked as separate series ─────────────
-  // Anchor prediction to NOW (not the last, possibly-stale data point)
+  // ── Project forward — BUY and SELL as separate series ─────────────────────
+  // STABILITY: prediction is anchored to the long-term mean + seasonal pattern,
+  // NOT recent momentum or random noise. This makes it consistent regardless of
+  // exactly where you start it (no spiky/flat dependence on the last few points).
   const nowTs = Date.now();
   const predStartTs = Math.max(last.t, nowTs);
   let buyPrice   = last.b || mean;
   let sellPrice  = last.s || (last.b ? last.b * spreadMean : sellMean);
-  let buyMom     = slopePerStep  > 0 ? Math.min(slopePerStep*3,  stdDev*0.02) : Math.max(slopePerStep*3,  -stdDev*0.02);
-  let sellMom    = 0; // sell momentum starts neutral, builds from sellSlope in loop
-  let buyNoise = 0, sellNoise = 0, spreadNoise = 0;
+  // Small initial momentum only — heavily damped, just smooths the first few steps
+  let buyMom     = Math.max(-stdDev*0.01, Math.min(stdDev*0.01, slopePerStep));
+  let sellMom    = 0;
   let trendOffset = 0, sellTrendOffset = 0;
   const result = [];
-  const rho = 0.7;
+
+  // Deterministic pseudo-cycle wobble (NOT random) — same every run.
+  // Uses the detected cycle only; no Math.random so backtests are reproducible.
 
   for (let i = 1; i <= steps; i++) {
     const ts = predStartTs + i * stepMs;
-    // Trend decays exponentially — strong early, fades over the forecast horizon
+    // Trend decays — strong early, fades over horizon
     const trendDecay = Math.exp(-i / (steps * 0.4));
     trendOffset     += slopePerStep * trendDecay;
     sellTrendOffset += sellSlope * (intervalMs/stepMs) * trendDecay;
 
-    // Shared seasonal + event multipliers (events affect both buy and sell)
+    // Seasonal pattern (the main driver of shape)
     let seasonalMult = 1.0;
     if (usePattern) {
       const phase = ((ts - SB_EPOCH) % SB_YEAR_MS + SB_YEAR_MS) % SB_YEAR_MS / SB_YEAR_MS;
       const bin   = Math.min(NUM_BINS-1, Math.floor(phase * NUM_BINS));
       seasonalMult = pattern[bin];
     }
+    // Detected cycle (deterministic sine, capped small)
     const cyclic = cycleAmp * Math.sin(2*Math.PI*i/Math.max(1,bestCycleSteps) + cyclePhaseOffset);
     const { boost, reasons } = getEventInfo(ts);
     const eventMult = 1.0 + boost;
 
-    // ── BUY price ───────────────────────────────────────────────────────────
+    // BUY: pull toward seasonal-adjusted mean. Strong pull = stable, mean-reverting.
     const buyTarget = (buyMean + trendOffset) * seasonalMult * eventMult + cyclic;
     const buyDist   = buyTarget - buyPrice;
-    const buyPull   = buyDist * Math.min(0.12, 0.04 + Math.abs(buyDist/Math.max(buyMean,1))*0.15);
-    buyNoise = rho*buyNoise + (1-rho)*(Math.random()-0.5)*2*stepVol;
-    buyMom *= 0.92;
-    buyPrice = buyPrice + buyPull + buyMom + buyNoise;
+    const buyPull   = buyDist * 0.10; // constant, moderate reversion
+    buyMom *= 0.85;
+    buyPrice = buyPrice + buyPull + buyMom;
     if (buyPrice <= 0) buyPrice = buyMean * 0.5;
 
-    // ── SELL price — own trend & cycle, but spread mean-reverts to historical ─
-    // Sell follows its own dynamics but stays in a realistic band vs buy
+    // SELL: own seasonal-adjusted mean, spread-constrained
     const sellTarget = (sellMean + sellTrendOffset) * seasonalMult * eventMult + cyclic * buySellRatio;
     const sellDist   = sellTarget - sellPrice;
-    const sellPull   = sellDist * Math.min(0.12, 0.04 + Math.abs(sellDist/Math.max(sellMean,1))*0.15);
-    sellNoise = rho*sellNoise + (1-rho)*(Math.random()-0.5)*2*stepVol*buySellRatio;
-    sellMom *= 0.92;
-    sellPrice = sellPrice + sellPull + sellMom + sellNoise;
+    const sellPull   = sellDist * 0.10;
+    sellMom *= 0.85;
+    sellPrice = sellPrice + sellPull + sellMom;
 
-    // Spread sanity: sell should stay below buy by roughly the historical spread
-    // Soft-constrain: pull spread back toward spreadMean if it drifts too far
+    // Keep spread realistic (deterministic — pull toward historical spread mean)
     const curSpread = buyPrice > 0 ? sellPrice / buyPrice : spreadMean;
-    spreadNoise = rho*spreadNoise + (1-rho)*(Math.random()-0.5)*2*spreadStd;
-    const targetSpread = spreadMean + spreadNoise;
-    if (Math.abs(curSpread - targetSpread) > spreadStd * 3) {
-      // Spread drifted too far — nudge sell back toward realistic spread
-      sellPrice = buyPrice * (curSpread + (targetSpread - curSpread) * 0.3);
+    if (Math.abs(curSpread - spreadMean) > spreadStd * 2) {
+      sellPrice = buyPrice * (curSpread + (spreadMean - curSpread) * 0.5);
     }
     if (sellPrice <= 0) sellPrice = buyPrice * spreadMean;
-    if (sellPrice >= buyPrice) sellPrice = buyPrice * Math.min(0.999, spreadMean); // sell never above buy
+    if (sellPrice >= buyPrice) sellPrice = buyPrice * Math.min(0.999, spreadMean);
 
     if (i % outputEvery === 0) {
       result.push({
