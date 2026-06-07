@@ -210,7 +210,19 @@ async function refreshMayor(env) {
   }
 
   // Election timing — use raw API closing directly (no arithmetic)
-  const electionClosing = raw.current?.closing || 0;
+  // Election ends at Late Spring 27th 00:00 (SB day 89) each SkyBlock year.
+  // The Hypixel API 'closing' field is unreliable, so compute from the SB calendar.
+  // Months: Early Spring(1) ... Late Spring(3) ... so Late Spring 27 = (3-1)*31 + 27 = day 89.
+  // 00:00 of day 89 = offset of 88 full SB days from year start.
+  const ELECTION_DAY = 89;
+  const nowForElection = Date.now();
+  const elecYear = Math.floor((nowForElection - SB_EPOCH) / SB_YEAR_MS);
+  const elecYearStart = SB_EPOCH + elecYear * SB_YEAR_MS;
+  let electionClosing = elecYearStart + (ELECTION_DAY - 1) * SB_DAY_MS;
+  if (electionClosing <= nowForElection) electionClosing += SB_YEAR_MS; // next year's election
+  // If the API gives a closing value that's in the future and sooner, trust it (more precise)
+  const apiClosing = raw.current?.closing || 0;
+  if (apiClosing > nowForElection && apiClosing < electionClosing) electionClosing = apiClosing;
 
   // Candidates with their perks
   const candidates = (raw.current?.candidates||[]).map(c=>({
@@ -262,28 +274,39 @@ async function handleHistory(tag, period, env, ctx) {
   try {
     const base = 'https://sky.coflnet.com/api/bazaar/'+encodeURIComponent(tag);
     let endpoint;
-    if (period==='hour') { endpoint = base+'/history/hour'; }
+    // CoflNet dedicated endpoints return finer resolution than the date-range endpoint:
+    //  /history/hour  → last 1h  (~20s-1min points)
+    //  /history/day   → last 24h (~5min points)
+    //  /history/week  → last 7d  (~hourly points)
+    //  /history?start&end → custom range but DAILY aggregates for long spans
+    if (period==='hour')      endpoint = base+'/history/hour';
+    else if (period==='day')  endpoint = base+'/history/day';
+    else if (period==='week') endpoint = base+'/history/week';
     else {
-      const days = period==='day'?1:period==='week'?7:period==='month'?30:period==='month3'?90:period==='month6'?180:30;
+      // month/3m/6m: date-range endpoint (daily resolution is all CoflNet has for old data)
+      const days = period==='month'?30:period==='month3'?90:period==='month6'?180:30;
       const end=new Date(), start=new Date(end.getTime()-days*86400000);
       endpoint = base+'/history?start='+start.toISOString()+'&end='+end.toISOString();
     }
     const r=await fetch(endpoint,{headers:{'User-Agent':'sb-flipper/1.0',Accept:'application/json'}});
     if (!r.ok) throw new Error('CoflNet '+r.status);
     const raw=await r.json();
-    const rawArr = Array.isArray(raw)?raw:(raw.points||raw.data||[]);
+    const rawArr = Array.isArray(raw)?raw:(raw.points||raw.data||raw.prices||[]);
     let points = rawArr
       .map(p=>({
         t:new Date(p.timestamp||p.time||p.t||0).getTime(),
-        b:r1(p.buy||p.buyPrice||p.b||0),
+        b:r1(p.buy||p.buyPrice||p.b||p.avg||0),
         s:r1(p.sell||p.sellPrice||p.s||0),
-        bv:p.buyVolume||p.bv||0, sv:p.sellVolume||p.sv||0,
+        bv:p.buyVolume||p.bv||p.volume||0, sv:p.sellVolume||p.sv||0,
       }))
       .filter(p=>(p.b>0||p.s>0)&&p.t>0).sort((a,b)=>a.t-b.t);
 
-    // Resample to target resolution:
-    //  All periods use 20-minute (1 SkyBlock day) resolution for consistency
-    const targetInterval = period==='hour' ? 300000 : 1200000; // hour=5min, rest=20min
+    // Resample only to smooth — use the source resolution, don't force coarser
+    //  hour=1min, day=5min, week=20min, month+=hourly(or daily if that's all there is)
+    const targetInterval = period==='hour' ? 60000
+                         : period==='day'  ? 300000
+                         : period==='week' ? 1200000
+                         : 3600000;
     points = resample(points, targetInterval);
 
     // Get mayor + Jacob data for analytics
