@@ -264,7 +264,7 @@ async function handleHistory(tag, period, env, ctx) {
     let endpoint;
     if (period==='hour') { endpoint = base+'/history/hour'; }
     else {
-      const days = period==='day'?2:period==='week'?7:period==='month'?30:period==='month3'?90:period==='month6'?180:30;
+      const days = period==='day'?1:period==='week'?7:period==='month'?30:period==='month3'?90:period==='month6'?180:30;
       const end=new Date(), start=new Date(end.getTime()-days*86400000);
       endpoint = base+'/history?start='+start.toISOString()+'&end='+end.toISOString();
     }
@@ -272,7 +272,7 @@ async function handleHistory(tag, period, env, ctx) {
     if (!r.ok) throw new Error('CoflNet '+r.status);
     const raw=await r.json();
     const rawArr = Array.isArray(raw)?raw:(raw.points||raw.data||[]);
-    const points = rawArr
+    let points = rawArr
       .map(p=>({
         t:new Date(p.timestamp||p.time||p.t||0).getTime(),
         b:r1(p.buy||p.buyPrice||p.b||0),
@@ -280,6 +280,13 @@ async function handleHistory(tag, period, env, ctx) {
         bv:p.buyVolume||p.bv||0, sv:p.sellVolume||p.sv||0,
       }))
       .filter(p=>(p.b>0||p.s>0)&&p.t>0).sort((a,b)=>a.t-b.t);
+
+    // Resample to target resolution:
+    //  1h -> 5min (raw), 1d -> 20min, 1w/1m/3m/6m -> 1h
+    const targetInterval = period==='hour' ? 300000
+                         : period==='day'  ? 1200000   // 20 minutes
+                         : 3600000;                     // 1 hour
+    points = resample(points, targetInterval);
 
     // Get mayor + Jacob data for analytics
     let mayorData=null, jacobContests=[];
@@ -295,6 +302,25 @@ async function handleHistory(tag, period, env, ctx) {
   } catch(e) {
     return json({success:false,error:e.message,tag,period,points:[],analytics:null});
   }
+}
+
+// Resample points to a fixed interval by bucketing and averaging
+function resample(points, intervalMs) {
+  if (points.length === 0) return points;
+  const buckets = new Map();
+  for (const p of points) {
+    const bucket = Math.floor(p.t / intervalMs) * intervalMs;
+    if (!buckets.has(bucket)) buckets.set(bucket, { t:bucket, bSum:0, sSum:0, bvSum:0, svSum:0, count:0 });
+    const b = buckets.get(bucket);
+    b.bSum += p.b; b.sSum += p.s; b.bvSum += p.bv; b.svSum += p.sv; b.count++;
+  }
+  return [...buckets.values()].map(b => ({
+    t: b.t,
+    b: r1(b.bSum / b.count),
+    s: r1(b.sSum / b.count),
+    bv: Math.round(b.bvSum / b.count),
+    sv: Math.round(b.svSum / b.count),
+  })).sort((a,b)=>a.t-b.t);
 }
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
@@ -402,8 +428,8 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   }
 
   // Cycle amplitude: std dev of the cyclic component
-  const cycleAmp = bestCorr > 0.1 && bestCycleSteps > 0
-    ? stdDev * Math.sqrt(bestCorr) * 0.6
+  const cycleAmp = bestCorr > 0.15 && bestCycleSteps > 0
+    ? Math.min(stdDev * Math.sqrt(bestCorr) * 0.4, mean * 0.15)
     : 0;
 
   // Current phase of detected cycle
@@ -443,11 +469,14 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   // If pattern is flat (patStd < 0.01), don't use it — item has no seasonal cycle
   const usePattern = patStd > 0.01;
 
-  // ── Model 3: Long-term trend ───────────────────────────────────────────────
-  const trendN = Math.min(prices.length, Math.round(90 * 86400000 / intervalMs));
+  // ── Model 3: Long-term trend (damped — real prices don't trend forever) ────
+  const trendN = Math.min(prices.length, Math.round(30 * 86400000 / intervalMs));
   const longSlope = linearSlope(prices.slice(-trendN)); // per data-interval step
-  // Convert to per-stepMs
-  const slopePerStep = longSlope * (intervalMs / stepMs);
+  // Convert to per-stepMs, then DAMP heavily — trend decays over the forecast
+  const rawSlopePerStep = longSlope * (intervalMs / stepMs);
+  // Cap trend so it can't move price more than ~30% over the whole forecast
+  const maxTrendTotal = mean * 0.30;
+  const slopePerStep = Math.sign(rawSlopePerStep) * Math.min(Math.abs(rawSlopePerStep), maxTrendTotal / steps);
 
   // ── Event boost function ───────────────────────────────────────────────────
   const getEventInfo = (ts) => {
@@ -522,24 +551,30 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   const stepVol  = dailyVol * Math.sqrt(stepMs / 86400000) * 0.5; // scaled to stepMs
 
   // ── Sell-price trend & cycle (computed independently) ─────────────────────
-  const sellSlope = sellPrices.length > 5
-    ? linearSlope(sellPrices.slice(-Math.min(sellPrices.length, trendN))) * (intervalMs / stepMs)
-    : slopePerStep * buySellRatio;
+  const rawSellSlope = sellPrices.length > 5
+    ? linearSlope(sellPrices.slice(-Math.min(sellPrices.length, trendN)))
+    : longSlope * buySellRatio;
+  const sellSlope = Math.sign(rawSellSlope) * Math.min(Math.abs(rawSellSlope), maxTrendTotal / steps / (intervalMs/stepMs));
 
   // ── Project forward — BUY and SELL tracked as separate series ─────────────
+  // Anchor prediction to NOW (not the last, possibly-stale data point)
+  const nowTs = Date.now();
+  const predStartTs = Math.max(last.t, nowTs);
   let buyPrice   = last.b || mean;
   let sellPrice  = last.s || (last.b ? last.b * spreadMean : sellMean);
   let buyMom     = slopePerStep  > 0 ? Math.min(slopePerStep*3,  stdDev*0.02) : Math.max(slopePerStep*3,  -stdDev*0.02);
-  let sellMom    = sellSlope     > 0 ? Math.min(sellSlope*3,     stdDev*0.02) : Math.max(sellSlope*3,     -stdDev*0.02);
+  let sellMom    = 0; // sell momentum starts neutral, builds from sellSlope in loop
   let buyNoise = 0, sellNoise = 0, spreadNoise = 0;
   let trendOffset = 0, sellTrendOffset = 0;
   const result = [];
   const rho = 0.7;
 
   for (let i = 1; i <= steps; i++) {
-    const ts = last.t + i * stepMs;
-    trendOffset     += slopePerStep;
-    sellTrendOffset += sellSlope;
+    const ts = predStartTs + i * stepMs;
+    // Trend decays exponentially — strong early, fades over the forecast horizon
+    const trendDecay = Math.exp(-i / (steps * 0.4));
+    trendOffset     += slopePerStep * trendDecay;
+    sellTrendOffset += sellSlope * (intervalMs/stepMs) * trendDecay;
 
     // Shared seasonal + event multipliers (events affect both buy and sell)
     let seasonalMult = 1.0;
