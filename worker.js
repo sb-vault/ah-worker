@@ -7,103 +7,63 @@ const KV_TTL    = 130;
 // ── SkyBlock calendar constants ───────────────────────────────────────────────
 const SB_EPOCH   = 1560275700000; // calibrated epoch (election timing accurate)
 const SB_YEAR_MS = 446400000;     // 124 real hours × 3600000
-const SB_DAY_MS  = 1200000;       // 20 real minutes per SkyBlock day
-// SkyBlock months: 12 months × 31 days = 372 days
-// Months: Early Spring(1-31), Spring(32-62), Late Spring(63-93),
-//         Early Summer(94-124), Summer(125-155), Late Summer(156-186),
-//         Early Autumn(187-217), Autumn(218-248), Late Autumn(249-279),
-//         Early Winter(280-310), Winter(311-341), Late Winter(342-372)
-const SB_MONTH_NAMES = ['Early Spring','Spring','Late Spring','Early Summer','Summer','Late Summer','Early Autumn','Autumn','Late Autumn','Early Winter','Winter','Late Winter'];
+const SB_DAY_MS  = 1200000;       // 20 real minutes per SkyBlock day = 1 ingame day
+// 12 months × 31 days = 372 ingame days per year.
+// The SB YEAR BOUNDARY (day 1, month 1) falls 1d 5h 20m BEFORE the mayor changes.
+// Mayor changes at electionClosing. So calendar-day-1 = electionClosing - YEAR_BOUNDARY_OFFSET.
+const YEAR_BOUNDARY_OFFSET = (24 + 5) * 3600000 + 20 * 60000; // 1d 5h 20m = 105600000ms
 
-function sbDayOfYear(ts) {
-  const elapsed = ((ts - SB_EPOCH) % SB_YEAR_MS + SB_YEAR_MS) % SB_YEAR_MS;
-  return Math.floor(elapsed / SB_DAY_MS) + 1; // 1-372
+// Given a timestamp and the current electionClosing, return {month(1-12), day(1-31), dayOfYear(1-372)}
+function sbCalendar(ts, electionClosing) {
+  // Year boundary (day 1, month 1) = electionClosing - 1d5h20m. Fall back to epoch.
+  let boundary = (electionClosing || 0) - YEAR_BOUNDARY_OFFSET;
+  if (!boundary) boundary = SB_EPOCH;
+  let yearsOff = Math.floor((ts - boundary) / SB_YEAR_MS);
+  const yearStart = boundary + yearsOff * SB_YEAR_MS;
+  let dayOfYear = Math.floor((ts - yearStart) / SB_DAY_MS); // 0-371
+  dayOfYear = ((dayOfYear % 372) + 372) % 372;
+  const month = Math.floor(dayOfYear / 31) + 1; // 1-12
+  const day   = (dayOfYear % 31) + 1;           // 1-31
+  return { month, day, dayOfYear: dayOfYear + 1, yearStart, intoDayMs: ((ts - yearStart) % SB_DAY_MS + SB_DAY_MS) % SB_DAY_MS };
 }
-function sbYearNum(ts) { return Math.floor((ts - SB_EPOCH) / SB_YEAR_MS); }
-function sbYearStart(ts) { return SB_EPOCH + sbYearNum(ts) * SB_YEAR_MS; }
+function sbDayOfYear(ts, ec) { return sbCalendar(ts, ec).dayOfYear; }
 
-// ── Fixed annual events (day range within SkyBlock year, 1-indexed) ───────────
-// Spooky: Autumn 29-31 = days 218+28..218+30 = 246-248
-// Pre-spooky hype: Fear Mongerer from Autumn 26 = day 243
-// Fishing Festival: Early Spring 1-3 = days 1-3 (Marina mayor required, but also base)
-// Season of Jerry: Late Winter 1-22 = days 342-363 (approx)
-// New Year: Late Winter 29-31 = days 370-372
-// Mining Fiesta: only when Cole/Foxy (handled via perks)
-// Bank Interest: 1st of every month (every 31 days starting day 1)
-// Dark Auction: every 3 real days = every 216 SB days (but 124 per year = every ~3 SB days)
-// Traveling Zoo: every 124/6 ≈ 20.7 SB days
-
-const FIXED_EVENTS = [
-  // { name, startDay, endDay, itemPatterns, demandMultiplier }
-  { name:'Spooky Festival',     start:243, end:251,
-    items:['CANDY','GREEN_CANDY','PURPLE_CANDY','JACK_O_LANTERN','SPOOKY_FRAGMENT','BAT_ARTIFACT','BAT_RING','INTIMIDATION_ARTIFACT','ECTOPLASM','PUMPKIN'],
-    mult:1.5, spikeAt:246, spikeMult:1.8 },
-  { name:'Pre-Spooky Prep',     start:235, end:243,
-    items:['CANDY','GREEN_CANDY','PURPLE_CANDY'],
-    mult:1.2 },
-  { name:'Season of Jerry',     start:342, end:363,
-    items:['JERRY_BOX','BLUE_JERRY','GREEN_JERRY','PURPLE_JERRY','GOLDEN_JERRY','SNOWBALL'],
-    mult:1.6 },
-  { name:'New Year',            start:365, end:372,
-    items:['NEW_YEAR_CAKE','CAKE_BAG'],
-    mult:1.4 },
-  { name:'New Year Prep',       start:358, end:365,
-    items:['NEW_YEAR_CAKE','CAKE_BAG'],
-    mult:1.2 },
-  { name:'Traveling Zoo',       start:1, end:3,   // approximation, repeats ~6x/year
-    items:['ORINGO','ZOO_TICKET'],
-    mult:1.15 },
-  { name:'Late Winter Fishing', start:342, end:372,
-    items:['JERRY_FISHING','ICE_BAIT','FROZEN_STEVE'],
-    mult:1.3 },
-];
-
-// ── Perk → market effects ─────────────────────────────────────────────────────
-// Maps perk NAME → { items: [...], supplyChange: +1.0 = +100% supply, priceEffect: multiply }
-// Supply UP → price DOWN. Demand UP → price UP.
+// ── Perk → continuous market effects (persistent throughout the mayor term) ───
 const PERK_MARKET = {
-  // ── FARMING PERKS (supply↑ → price↓) ─────────────────────────────────────
-  'GOATed':             { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','SUGAR_CANE','PUMPKIN','MELON','CACTUS','COCOA_BEANS','NETHER_STALK','MUSHROOM_COLLECTION','SUNFLOWER','MOONFLOWER'], price:0.82 },
-  'Blooming Business':  { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','SUGAR_CANE','PUMPKIN','MELON','ENCHANTED_CARROT','ENCHANTED_POTATO','ENCHANTED_WHEAT'], price:0.85 },
-  'Pest Eradicator':    { items:['ENCHANTED_COOKIE','COMPOSTER_UPGRADE','PESTICIDE','WHEAT','CARROT_ITEM'], price:0.88 },
+  'GOATed':             { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','SUGAR_CANE','PUMPKIN','MELON','CACTUS','COCOA_BEANS','NETHER_STALK','MUSHROOM_COLLECTION'], price:0.82 },
+  'Blooming Business':  { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','SUGAR_CANE','PUMPKIN','MELON'], price:0.85 },
   'Pelt-pocalypse':     { items:['FUR','PELT','RABBIT_FOOT'], price:0.80 },
-  'Grand Feast':        { items:['WHEAT','POTATO_ITEM','CARROT_ITEM','MUSHROOM_COLLECTION'], price:0.90 }, // Finnegan special
-
-  // ── MINING PERKS (supply↑ → price↓) ──────────────────────────────────────
   'Prospection':        { items:['MITHRIL_ORE','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','EMERALD','LAPIS_LAZULI','REDSTONE','QUARTZ','GEMSTONE'], price:0.82 },
-  'Mining Fiesta':      { items:['MITHRIL_ORE','COBBLESTONE','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','HARD_STONE'], price:0.75, tempDuration:0.02 }, // ~2% of year
-  'Molten Forge':       { items:['ENCHANTED_IRON_BLOCK','ENCHANTED_GOLD_BLOCK','ENCHANTED_DIAMOND','HARD_STONE','HOT_STUFF'], price:0.84 },
-
-  // ── FISHING PERKS (supply↑ → price↓ for fish, demand↑ for equipment) ─────
-  'Fishing Festival':   { items:['RAW_FISH','SPONGE','SHARK_FIN','DOLPHIN','SEA_CREATURE_BAIT','FISHING_BAIT'], price:0.80, tempDuration:0.024 },
+  'Molten Forge':       { items:['ENCHANTED_IRON_BLOCK','ENCHANTED_GOLD_BLOCK','ENCHANTED_DIAMOND','HARD_STONE'], price:0.84 },
   'Luck of the Sea 2.0':{ items:['RAW_FISH','TROPHY_FISH','SEA_CREATURE_BAIT'], price:0.88 },
-
-  // ── SLAYER PERKS (supply↑ → price↓ for slayer drops) ─────────────────────
   'SLASHED Pricing':    { items:['CORRUPTED_FRAGMENT','WITHER_ESSENCE','SPIDER_CATALYST','REVENANT_FLESH'], price:0.85 },
   'Pathfinder':         { items:['REVENANT_FLESH','TARANTULA_SILK','WOLF_TOOTH','VOIDLING_NUCLEUS'], price:0.88 },
-  'Slayer XP Buff':     { items:['REVENANT_FLESH','TARANTULA_SILK','WOLF_TOOTH','SADAN_BROOCH'], price:0.90 },
-
-  // ── DEMAND PERKS (demand↑ → price↑) ──────────────────────────────────────
-  'Mythological Ritual':{ items:['GRIFFIN_FEATHER','MINOS_RELIC','CHIMERA','MAGICAL_MUSHROOM_SOUP','ANCIENT_CLAW','MINOTAUR_PET','GRIFFIN_PET'], price:1.45 },
-  'Darker Auctions':    { items:['SCYTHE_BLADE','WITHER_BLOOD','SHADOW_ASSASSIN_CLOAK','SHADOW_FURY','DARK_CACAO_TRUFFLE'], price:1.30 },
-  'Shopping Spree':     { items:['BOOSTER_COOKIE','DUNGEON_ORBS','BEACON','BITS'], price:1.20 },
-  'Volume Trading':     { items:['BOOSTER_COOKIE','DARK_CACAO_TRUFFLE','STOCK_OF_STONKS'], price:1.25 },
-  'Extra Event':        { items:['CANDY','GREEN_CANDY','PURPLE_CANDY','RAW_FISH','MITHRIL_ORE'], price:1.20 },
+  'Darker Auctions':    { items:['SCYTHE_BLADE','WITHER_BLOOD','SHADOW_ASSASSIN_CLOAK','SHADOW_FURY'], price:1.30 },
+  'Shopping Spree':     { items:['BOOSTER_COOKIE','DUNGEON_ORBS','BEACON'], price:1.20 },
   'Pet XP Buff':        { items:['PET_ITEM_TIER_BOOST','EXP_BOTTLE','GRAND_EXP_BOTTLE','TITANIC_EXP_BOTTLE'], price:1.15 },
-  'Sharing is Caring':  { items:['PET_ITEM_TIER_BOOST','EXP_BOTTLE','GRAND_EXP_BOTTLE'], price:1.12 },
-
-  // ── SPECIAL MAYOR EFFECTS ─────────────────────────────────────────────────
-  // Derpy: doubles XP → huge demand for XP-boosting items
-  'Turbo-Minions I':    { items:['ENCHANTED_EGG','SUPER_EGG','OAK_LOG','BIRCH_LOG'], price:1.35 },
-  'Mayor XP Buff':      { items:['GRAND_EXP_BOTTLE','TITANIC_EXP_BOTTLE','CORRUPTED_FRAGMENT'], price:1.40 },
-  // Scorpius: dark auction items spike
-  'Bribe':              { items:['SCYTHE_BLADE','WITHER_BLOOD','SHADOW_FURY'], price:1.20 },
-  // Foxy
-  'Sweet Benevolence':  { items:['CARNIVAL_TICKET','CARNIVAL_MASK','PARTY_HAT_CINNAMON'], price:1.30 },
-  'Chivalrous Carnival':{ items:['CARNIVAL_TICKET','CARNIVAL_MASK'], price:1.25 },
-  // Diaz: trading doubles
-  'Stock Exchange':     { items:['STOCK_OF_STONKS','BOOSTER_COOKIE'], price:1.15 },
 };
+
+// Items affected by each perk-conditional special event
+const EVENT_ITEMS = {
+  spooky:      ['CANDY','GREEN_CANDY','PURPLE_CANDY','JACK_O_LANTERN','SPOOKY_FRAGMENT','PUMPKIN'],
+  jerry:       ['JERRY_BOX_GREEN','JERRY_BOX_BLUE','JERRY_BOX_PURPLE','JERRY_BOX_GOLDEN','SNOWBALL','WHITE_GIFT','GREEN_GIFT'],
+  mythological:['GRIFFIN_FEATHER','MINOS_RELIC','CHIMERA','MAGICAL_MUSHROOM_SOUP','ANCIENT_CLAW','MINOTAUR','GRIFFIN'],
+  fishing:     ['RAW_FISH','SPONGE','SHARK_FIN','PUFFERFISH','LILY_PAD','MAGMA_FISH','ICE_FISH'],
+  mining:      ['MITHRIL_ORE','COAL','IRON_INGOT','GOLD_INGOT','DIAMOND','EMERALD','REDSTONE','LAPIS_LAZULI','HARD_STONE','GEMSTONE_POWDER'],
+  stonk:       ['BOOSTER_COOKIE','STOCK_OF_STONKS','DARK_CACAO_TRUFFLE'],
+  // Crops for Jacob/Starlyn contests
+  crops:       ['WHEAT','CARROT_ITEM','POTATO_ITEM','SUGAR_CANE','PUMPKIN','MELON','CACTUS','COCOA_BEANS','MUSHROOM_COLLECTION','NETHER_STALK'],
+};
+
+// Returns true if a given perk name is currently active (mayor OR minister)
+function hasPerk(mayorData, perkName) {
+  return mayorData && Array.isArray(mayorData.activePerks) && mayorData.activePerks.includes(perkName);
+}
+// Returns true if a named candidate currently holds office (mayor or minister)
+function holdsOffice(mayorData, name) {
+  if (!mayorData) return false;
+  return mayorData.currentMayor === name || mayorData.ministerName === name;
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -409,10 +369,18 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   if (!last || prices.length < 10) return [];
 
   // 1h period predicts at 5-min resolution; all others at 20-min, output hourly
-  const stepMs      = period==='hour' ? 300000 : SB_DAY_MS;
-  const outputEvery = period==='hour' ? 1 : 3;
-  const futureDays  = period==='hour' ? 1 : 30; // 1h period only predicts 1h-ish ahead... use 1 day cap
-  const steps       = Math.round(futureDays * 86400000 / stepMs);
+  // Per-period DISPLAY resolution (the visible spacing of prediction points):
+  //  1h→1min, 1d→5min, 1w/1m→1hr, 3m→8hr, 6m→24hr
+  // Internally we always step at 20min (5min for 1h) for event precision, but only
+  // OUTPUT points at the display interval so the line looks right for the timeframe.
+  const stepMs = period==='hour' ? 300000 : 1200000; // 5min for 1h, else 20min
+  const displayIntervalMs = ({
+    hour:60000, day:300000, week:3600000, month:3600000, month3:8*3600000, month6:24*3600000
+  })[period] || 3600000;
+  const outputEvery = Math.max(1, Math.round(displayIntervalMs / stepMs));
+  // How far ahead to predict: enough to fill the timeframe's forward view
+  const futureDays = period==='hour' ? 1 : period==='day' ? 2 : 30;
+  const steps = Math.round(futureDays * 86400000 / stepMs);
 
   // ── Separate buy & sell price series ──────────────────────────────────────
   const buyPrices  = points.map(p => p.b).filter(v => v > 0);
@@ -500,89 +468,116 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   const maxTrendTotal = mean * 0.30;
   const slopePerStep = Math.sign(rawSlopePerStep) * Math.min(Math.abs(rawSlopePerStep), maxTrendTotal / steps);
 
-  // ── Event boost function ───────────────────────────────────────────────────
+  // ── Event boost function — implements exact SkyBlock event rules ───────────
+  const tagU = tag.toUpperCase();
+  const elecClose = mayorData?.electionClosing || 0;
+  // Active perks held by current mayor+minister (perk name set)
+  const activePerkSet = new Set((mayorData?.activePerks || []));
+  const leadingPerkSet = new Set((mayorData?.leadingPerks || []));
+
+  // Crop name → bazaar id (Jacob/Starlyn)
+  const CROP_MAP = {
+    'Wheat':'WHEAT','Carrot':'CARROT_ITEM','Potato':'POTATO_ITEM','Sugar Cane':'SUGAR_CANE',
+    'Pumpkin':'PUMPKIN','Melon':'MELON','Cactus':'CACTUS','Cocoa Beans':'COCOA_BEANS',
+    'Mushroom':'MUSHROOM_COLLECTION','Nether Wart':'NETHER_STALK',
+  };
+  const FARMING_ITEMS = new Set(Object.values(CROP_MAP));
+  const isCrop = Object.values(CROP_MAP).includes(tagU);
+
+  // Perk active now (mayor/minister) OR predicted to be active (leading candidate wins)
+  const perkActiveNowOrFuture = (perk) => activePerkSet.has(perk) || leadingPerkSet.has(perk);
+  // At a given timestamp, does the perk apply?
+  //  - if currently active: applies before election; after election fades unless leading also has it
+  //  - if only leading has it: applies only after election
+  const perkAppliesAt = (perk, ts) => {
+    const nowHas = activePerkSet.has(perk);
+    const futHas = leadingPerkSet.has(perk);
+    if (elecClose <= 0) return nowHas;
+    if (ts <= elecClose) return nowHas;
+    return futHas; // after election, only if the incoming mayor has it
+  };
+
   const getEventInfo = (ts) => {
     let boost = 0;
     const reasons = [];
-    const sbDay = sbDayOfYear(ts);
+    const cal = sbCalendar(ts, elecClose);
+    const m = cal.month, d = cal.day, doy = cal.dayOfYear;
 
-    // Fixed annual events — exact item ID match only
-    for (const evt of FIXED_EVENTS) {
-      if (sbDay >= evt.start && sbDay <= evt.end) {
-        const tagU = tag.toUpperCase();
-        const match = evt.items.some(id => tagU === id.toUpperCase());
-        if (match) {
-          const m = evt.spikeAt && sbDay >= evt.spikeAt ? (evt.spikeMult||evt.mult) : evt.mult;
-          boost += m - 1.0;
-          reasons.push(evt.name);
-        }
-      }
+    // ── 1. Fixed calendar events ────────────────────────────────────────────
+    // Spooky Festival — month 8, days 29-31 inclusive
+    if (m===8 && d>=29 && d<=31 && EVENT_ITEMS.spooky.includes(tagU)) {
+      boost += 0.5; reasons.push('Spooky Festival');
+    }
+    // Season of Jerry — month 12, days 24-26 inclusive
+    if (m===12 && d>=24 && d<=26 && EVENT_ITEMS.jerry.includes(tagU)) {
+      boost += 0.5; reasons.push('Season of Jerry');
     }
 
-    // Mayor effects
-    if (mayorData?.itemEffects?.[tag]) {
-      const eff = mayorData.itemEffects[tag];
-      if (mayorData.electionClosing > 0 && ts > mayorData.electionClosing) {
-        const daysAfter = (ts - mayorData.electionClosing) / 86400000;
-        const w = Math.max(0, 1 - daysAfter / 7);
-        boost += (eff - 1.0) * w;
-        if (Math.abs(eff-1) > 0.05 && w > 0.1) reasons.push('Mayor (fading)');
-      } else {
-        boost += eff - 1.0;
-        const r = mayorData.perkReasons?.[tag];
-        if (r?.length) reasons.push(r[0].perk);
-      }
-    }
-    // Future mayor
-    if (mayorData?.futureItemEffects?.[tag] && mayorData.electionClosing > 0 && ts > mayorData.electionClosing) {
-      const fe = mayorData.futureItemEffects[tag];
-      const daysAfter = (ts - mayorData.electionClosing) / 86400000;
-      const w = Math.min(1, daysAfter / 3);
-      boost += (fe - 1.0) * w;
-      if (Math.abs(fe-1) > 0.05 && w > 0.1) reasons.push('New mayor: '+mayorData.leadingCandidate);
-    }
-
-    // Jacob's Farming Contests — each contest lasts 20 min and features exactly 3 crops.
-    // The exact bazaar item IDs for each crop name from the API:
-    if (jacobContests?.length) {
-      const CROP_MAP = {
-        'Wheat':'WHEAT',
-        'Carrot':'CARROT_ITEM',
-        'Potato':'POTATO_ITEM',
-        'Sugar Cane':'SUGAR_CANE',
-        'Pumpkin':'PUMPKIN',
-        'Melon':'MELON',
-        'Cactus':'CACTUS',
-        'Cocoa Beans':'COCOA_BEANS',
-        'Mushroom':'MUSHROOM_COLLECTION',
-        'Nether Wart':'NETHER_STALK',
-        'Sunflower':'SUNFLOWER',         // not bazaar but kept for completeness
-        'Moonflower':'MOONFLOWER',
-        'Wild Rose':'WILD_ROSE',
-      };
-      const tagU = tag.toUpperCase();
-      const CONTEST_LEN = 1200000;       // 20 minutes
-      const PRE  = 1800000;              // farmers stockpile ~30 min before
-      const POST = 1800000;              // sell-off ~30 min after
+    // ── 2. Jacob's Contests (API — exact crops; run xx:15 to xx:35 IRL) ──────
+    if (isCrop && jacobContests?.length) {
       for (const ct of jacobContests) {
-        const cStart = ct.timestamp, cEnd = ct.timestamp + CONTEST_LEN;
-        if (ts >= cStart - PRE && ts <= cEnd + POST) {
+        const cStart = ct.timestamp, cEnd = ct.timestamp + 1200000; // 20 min
+        if (ts >= cStart - 900000 && ts <= cEnd + 900000) {
           for (const cropName of (ct.cropNames || [])) {
-            const id = CROP_MAP[cropName];
-            // EXACT match only — no loose substring matching
-            if (id && tagU === id) {
-              // During contest: demand spikes (price up). Pre-contest: stockpiling (mild up).
-              const inContest = ts >= cStart && ts <= cEnd;
-              boost += inContest ? 0.25 : 0.12;
+            if (CROP_MAP[cropName] === tagU) {
+              boost += (ts >= cStart && ts <= cEnd) ? 0.22 : 0.08;
               reasons.push('Jacob: '+cropName);
-              break; // one match is enough per contest
+              break;
             }
           }
         }
       }
     }
 
-    return { boost: Math.max(-0.5, Math.min(1.5, boost)), reasons };
+    // ── 3. Starlyn (Carnival) Contest — every ingame day, back-to-back ───────
+    // Continuous farming demand → mild upward pressure on ALL crops every day.
+    if (isCrop) {
+      boost += 0.05; reasons.push('Starlyn contest');
+    }
+
+    // ── 4. Mayor-perk-driven events (perk presence is what matters) ──────────
+    // Mythological Ritual (Diana perk): event for the WHOLE mayor term
+    if (perkActiveNowOrFuture('Mythological Ritual') && EVENT_ITEMS.mythological.includes(tagU)) {
+      if (perkAppliesAt('Mythological Ritual', ts)) { boost += 0.25; reasons.push('Mythological Ritual'); }
+    }
+    // Fishing Festival (Marina perk): first 3 days of EACH month → fish supply surge
+    if (perkActiveNowOrFuture('Fishing Festival') && d<=3 && EVENT_ITEMS.fishing.includes(tagU)) {
+      if (perkAppliesAt('Fishing Festival', ts)) { boost -= 0.15; reasons.push('Fishing Festival'); }
+    }
+    // Mining Fiesta (Cole perk): first 7 days of months 5-9 → ore supply surge
+    if (perkActiveNowOrFuture('Mining Fiesta') && m>=5 && m<=9 && d<=7 && EVENT_ITEMS.mining.includes(tagU)) {
+      if (perkAppliesAt('Mining Fiesta', ts)) { boost -= 0.18; reasons.push('Mining Fiesta'); }
+    }
+    // Stock Exchange (Diaz perk): whole mayor term
+    if (perkActiveNowOrFuture('Stock Exchange') && EVENT_ITEMS.stonk.includes(tagU)) {
+      if (perkAppliesAt('Stock Exchange', ts)) { boost += 0.12; reasons.push('Stock Exchange'); }
+    }
+
+    // ── 5. General mayor perk price effects (from worker's perk table) ───────
+    if (mayorData?.itemEffects?.[tag]) {
+      const eff = mayorData.itemEffects[tag];
+      if (elecClose > 0 && ts > elecClose) {
+        const daysAfter = (ts - elecClose) / 86400000;
+        const w = Math.max(0, 1 - daysAfter / 7);
+        boost += (eff - 1.0) * w;
+        if (Math.abs(eff-1) > 0.05 && w > 0.2) reasons.push('Mayor perk (fading)');
+      } else {
+        boost += eff - 1.0;
+        const r = mayorData.perkReasons?.[tag];
+        if (r?.length) reasons.push(r[0].perk);
+      }
+    }
+    if (mayorData?.futureItemEffects?.[tag] && elecClose > 0 && ts > elecClose) {
+      const fe = mayorData.futureItemEffects[tag];
+      const daysAfter = (ts - elecClose) / 86400000;
+      const w = Math.min(1, daysAfter / 3);
+      boost += (fe - 1.0) * w;
+      if (Math.abs(fe-1) > 0.05 && w > 0.2) reasons.push('New mayor: '+(mayorData.leadingCandidate||'?'));
+    }
+
+    // Dedupe reasons
+    const uniq = [...new Set(reasons)];
+    return { boost: Math.max(-0.6, Math.min(1.5, boost)), reasons: uniq };
   };
 
   // ── Correlated random walk (Ornstein–Uhlenbeck style) ─────────────────────
@@ -614,47 +609,62 @@ function buildPrediction(points, prices, tag, mean, stdDev, slopePerPoint, inter
   // Deterministic pseudo-cycle wobble (NOT random) — same every run.
   // Uses the detected cycle only; no Math.random so backtests are reproducible.
 
-  for (let i = 1; i <= steps; i++) {
+  for (let i = 0; i <= steps; i++) {
     const ts = predStartTs + i * stepMs;
     // Trend decays — strong early, fades over horizon
     const trendDecay = Math.exp(-i / (steps * 0.4));
-    trendOffset     += slopePerStep * trendDecay;
-    sellTrendOffset += sellSlope * (intervalMs/stepMs) * trendDecay;
+    if (i > 0) {
+      trendOffset     += slopePerStep * trendDecay;
+      sellTrendOffset += sellSlope * (intervalMs/stepMs) * trendDecay;
+    }
 
-    // Seasonal pattern (the main driver of shape)
+    // Seasonal pattern — but its INFLUENCE fades over the forecast so we don't
+    // just replay the same SB-year loop endlessly. Early prediction follows the
+    // recent level; later prediction leans on the seasonal/mean structure.
     let seasonalMult = 1.0;
     if (usePattern) {
       const phase = ((ts - SB_EPOCH) % SB_YEAR_MS + SB_YEAR_MS) % SB_YEAR_MS / SB_YEAR_MS;
       const bin   = Math.min(NUM_BINS-1, Math.floor(phase * NUM_BINS));
       seasonalMult = pattern[bin];
     }
-    // Detected cycle (deterministic sine, capped small)
-    const cyclic = cycleAmp * Math.sin(2*Math.PI*i/Math.max(1,bestCycleSteps) + cyclePhaseOffset);
+    // Multi-frequency deterministic drift (NOT a single repeating cycle).
+    // Combines the detected cycle with two slower incommensurate waves so the
+    // path evolves and doesn't visibly repeat over the forecast window.
+    const driftA = cycleAmp * Math.sin(2*Math.PI*i/Math.max(1,bestCycleSteps) + cyclePhaseOffset);
+    const driftB = cycleAmp * 0.5 * Math.sin(2*Math.PI*i/Math.max(1,bestCycleSteps*2.7) + 1.3);
+    const driftC = cycleAmp * 0.3 * Math.sin(2*Math.PI*i/Math.max(1,bestCycleSteps*0.41) + 2.1);
+    const drift = driftA + driftB + driftC;
+
     const { boost, reasons } = getEventInfo(ts);
     const eventMult = 1.0 + boost;
 
-    // BUY: pull toward seasonal-adjusted mean. Strong pull = stable, mean-reverting.
-    const buyTarget = (buyMean + trendOffset) * seasonalMult * eventMult + cyclic;
-    const buyDist   = buyTarget - buyPrice;
-    const buyPull   = buyDist * 0.10; // constant, moderate reversion
-    buyMom *= 0.85;
-    buyPrice = buyPrice + buyPull + buyMom;
-    if (buyPrice <= 0) buyPrice = buyMean * 0.5;
+    if (i > 0) {
+      // Blend target: early = anchored near recent price (mean-reverting slowly),
+      // late = seasonal-structured mean. Weight shifts with i.
+      const seasonalWeight = Math.min(1, i / (steps * 0.25)); // 0→1 over first quarter (less start-dependence)
+      const recentAnchor = (last.b || mean);
+      const buyMeanTarget = recentAnchor * (1 - seasonalWeight) + (buyMean) * seasonalWeight;
+      const buyTarget = (buyMeanTarget + trendOffset) * seasonalMult * eventMult + drift;
+      const buyDist   = buyTarget - buyPrice;
+      const buyPull   = buyDist * 0.08;
+      buyMom = buyMom * 0.88 + buyPull * 0.12; // momentum integrates pull (smoother, evolving)
+      buyPrice = buyPrice + buyPull + buyMom;
+      if (buyPrice <= 0) buyPrice = buyMean * 0.5;
 
-    // SELL: own seasonal-adjusted mean, spread-constrained
-    const sellTarget = (sellMean + sellTrendOffset) * seasonalMult * eventMult + cyclic * buySellRatio;
-    const sellDist   = sellTarget - sellPrice;
-    const sellPull   = sellDist * 0.10;
-    sellMom *= 0.85;
-    sellPrice = sellPrice + sellPull + sellMom;
+      const sellMeanTarget = (last.s || sellMean) * (1 - seasonalWeight) + sellMean * seasonalWeight;
+      const sellTarget = (sellMeanTarget + sellTrendOffset) * seasonalMult * eventMult + drift * buySellRatio;
+      const sellDist   = sellTarget - sellPrice;
+      const sellPull   = sellDist * 0.08;
+      sellMom = sellMom * 0.88 + sellPull * 0.12;
+      sellPrice = sellPrice + sellPull + sellMom;
 
-    // Keep spread realistic (deterministic — pull toward historical spread mean)
-    const curSpread = buyPrice > 0 ? sellPrice / buyPrice : spreadMean;
-    if (Math.abs(curSpread - spreadMean) > spreadStd * 2) {
-      sellPrice = buyPrice * (curSpread + (spreadMean - curSpread) * 0.5);
+      const curSpread = buyPrice > 0 ? sellPrice / buyPrice : spreadMean;
+      if (Math.abs(curSpread - spreadMean) > spreadStd * 2) {
+        sellPrice = buyPrice * (curSpread + (spreadMean - curSpread) * 0.5);
+      }
+      if (sellPrice <= 0) sellPrice = buyPrice * spreadMean;
+      if (sellPrice >= buyPrice) sellPrice = buyPrice * Math.min(0.999, spreadMean);
     }
-    if (sellPrice <= 0) sellPrice = buyPrice * spreadMean;
-    if (sellPrice >= buyPrice) sellPrice = buyPrice * Math.min(0.999, spreadMean);
 
     if (i % outputEvery === 0) {
       result.push({
